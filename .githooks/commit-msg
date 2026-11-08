@@ -1,0 +1,25 @@
+#!/usr/bin/env sh
+set -eu
+
+MSG_FILE="$1"
+REPO_ROOT="$(git rev-parse --show-toplevel)"
+run_py() {
+  if [ -x "${REPO_ROOT}/.venv/Scripts/python.exe" ] && "${REPO_ROOT}/.venv/Scripts/python.exe" -c "import sys; raise SystemExit(0 if sys.version_info >= (3, 11) else 1)" >/dev/null 2>&1; then
+    "${REPO_ROOT}/.venv/Scripts/python.exe" "$@"
+  elif [ -x "${REPO_ROOT}/.venv/bin/python" ] && "${REPO_ROOT}/.venv/bin/python" -c "import sys; raise SystemExit(0 if sys.version_info >= (3, 11) else 1)" >/dev/null 2>&1; then
+    "${REPO_ROOT}/.venv/bin/python" "$@"
+  elif command -v python3 >/dev/null 2>&1 && python3 -c "import sys; raise SystemExit(0 if sys.version_info >= (3, 11) else 1)" >/dev/null 2>&1; then
+    python3 "$@"
+  elif command -v python >/dev/null 2>&1 && python -c "import sys; raise SystemExit(0 if sys.version_info >= (3, 11) else 1)" >/dev/null 2>&1; then
+    python "$@"
+  elif command -v py >/dev/null 2>&1 && py -3 -c "import sys; raise SystemExit(0 if sys.version_info >= (3, 11) else 1)" >/dev/null 2>&1; then
+    py -3 "$@"
+  else
+    echo "[argus-guardrails] ERROR: Python 3.11+ interpreter not found on PATH." >&2
+    exit 1
+  fi
+}
+PATH_SEP="$(run_py -c "import os, sys; sys.stdout.write(os.pathsep)")"
+export PYTHONPATH="${REPO_ROOT}/src${PYTHONPATH:+${PATH_SEP}${PYTHONPATH}}"
+
+run_py -m argus_sql.guardrails.cli --repo-root "${REPO_ROOT}" --check-commit-msg "${MSG_FILE}"

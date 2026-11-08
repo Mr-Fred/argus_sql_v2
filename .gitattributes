@@ -1,0 +1,20 @@
+# Enforce deterministic LF line endings across Windows, macOS, and Linux so
+# POSIX Git hooks (.githooks/*), shell scripts, LaTeX tables, and SHA-256
+# feedback bundles never drift under Windows `core.autocrlf=true`.
+* text=auto eol=lf
+.githooks/* text eol=lf
+*.sh text eol=lf
+*.ps1 text eol=lf
+*.py text eol=lf
+*.json text eol=lf
+*.tex text eol=lf
+*.bib text eol=lf
+*.md text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+*.toml text eol=lf
+
+# Treat compiled manuscripts and SQLite database fixtures strictly as binary.
+*.pdf binary
+*.sqlite binary
+*.db binary

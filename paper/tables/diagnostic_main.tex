@@ -1,0 +1,19 @@
+\begin{table*}[t]
+\centering
+\small
+\caption{Controlled diagnostic evaluation on Mini-BIRD (24 clean relational queries) and Voice-BIRD (24 spoken ASR-perturbed utterances) across progressive NL2SQL system architectures.}
+\label{tab:diagnostic_main}
+\resizebox{\textwidth}{!}{%
+\begin{tabular}{lccccccc}
+\toprule
+\textbf{System / Configuration} & \textbf{Simple EX} & \textbf{Mod.\ EX} & \textbf{Chall.\ EX} & \textbf{Clean EX (\%)} & \textbf{Clean R-VES} & \textbf{Voice EX (\%)} & \textbf{Mean Tokens} \\
+\midrule
+B0\_ZeroShotDDL & 75.0 & 37.5 & 0.0 & 37.5 & 37.5 & 16.7 & 294 \\
+B1\_DINDecomposed & 100.0 & 25.0 & 0.0 & 41.7 & 41.7 & 25.0 & 218 \\
+B2\_MACRefiner & 100.0 & 37.5 & 0.0 & 45.8 & 45.8 & 25.0 & 215 \\
+B3\_CHESSValueConsistency & 100.0 & 62.5 & 0.0 & 54.2 & 54.2 & 41.7 & 726 \\
+\textbf{Argus-SQL} & \textbf{100.0} & \textbf{100.0} & \textbf{100.0} & \textbf{100.0} & \textbf{100.0} & \textbf{100.0} & 662 \\
+\bottomrule
+\end{tabular}%
+}
+\end{table*}

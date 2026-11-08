@@ -1,0 +1,16 @@
+{
+  "default_max_lines": 320,
+  "count_docstrings_and_comments": false,
+  "min_comment_ratio": 0.08,
+  "required_package_stems": [
+    "types",
+    "exceptions"
+  ],
+  "forbidden_catchall_stems": [
+    "implementation",
+    "everything",
+    "misc_all",
+    "god_module"
+  ],
+  "file_max_lines_overrides": {}
+}

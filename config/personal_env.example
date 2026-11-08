@@ -1,0 +1,20 @@
+# Personal Computer `.env` Template for Argus-SQL Live Evaluation
+# ---------------------------------------------------------------------------
+# IMPORTANT: Copy this file to `.env` ONLY on your personal computer where you
+# execute `.\scripts\run_personal_eval.ps1` (Windows PowerShell) or
+# `./scripts/run_personal_eval.sh` (macOS / Linux).
+# NEVER log into personal cloud accounts or store live API keys inside the
+# authoring environment; `.env` is gitignored and never leaves your computer.
+
+# Option A — Personal Google Cloud / Vertex AI (coupled with `gcloud auth application-default login`
+# on your personal machine; auto-discovers `%APPDATA%\gcloud\application_default_credentials.json`
+# on Windows or `~/.config/gcloud/application_default_credentials.json` on macOS/Linux):
+GOOGLE_GENAI_USE_VERTEXAI=TRUE
+GOOGLE_CLOUD_PROJECT=your-personal-gcp-project-id
+GOOGLE_CLOUD_LOCATION=global
+ARGUS_LLM_MODEL=gemini-2.5-flash
+
+# Option B — OpenAI-Compatible HTTPS or Local vLLM Endpoint (`127.0.0.1`):
+# ARGUS_LLM_API_KEY=your-personal-api-key-on-laptop-only
+# ARGUS_LLM_MODEL=gpt-4o
+# ARGUS_LLM_ENDPOINT_URL=http://127.0.0.1:8000/v1/chat/completions

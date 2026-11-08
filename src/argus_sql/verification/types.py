@@ -1,0 +1,43 @@
+"""Configuration and equivalence-cluster contracts for consensus arbitration."""
+
+import dataclasses
+
+
+# Tunable weights governing Argus invariant-weighted execution consensus.
+@dataclasses.dataclass(frozen=True)
+class VerifierConfig:
+  """Configuration controlling semantic verification and consensus scoring.
+
+  Attributes:
+    enable_semantic_invariants: If False, falls back to syntax/execution only.
+    enable_algebraic_repair: If True, runs zero-token dialect auto-repair.
+    error_issue_multiplier: Weight penalty factor per ERROR-level invariant.
+    warning_issue_multiplier: Weight penalty factor per WARNING-level invariant.
+    strategy_diversity_bonus: Bonus added per distinct agreeing strategy.
+  """
+
+  # Multiplicative penalty `0.28` ensures 2 clean votes beat 3 truncated votes.
+  enable_semantic_invariants: bool = True
+  enable_algebraic_repair: bool = True
+  error_issue_multiplier: float = 0.28
+  warning_issue_multiplier: float = 0.65
+  # Small diversity bonus (`0.15`) breaks ties in favor of orthogonal strategies.
+  strategy_diversity_bonus: float = 0.15
+
+
+# Equivalence cluster grouping candidates that produce identical result sets.
+@dataclasses.dataclass(frozen=True)
+class ConsensusCluster:
+  """Equivalence class of SQL candidates sharing an execution result signature.
+
+  Attributes:
+    result_signature: Canonical SHA-256 digest of the shared result tuples.
+    member_indices: Indices into the evaluated `VerifiedCandidate` sequence.
+    distinct_strategies: Unique synthesis strategy names inside this cluster.
+    total_score: Summed invariant-adjusted weight plus diversity bonus.
+  """
+
+  result_signature: str
+  member_indices: tuple[int, ...]
+  distinct_strategies: tuple[str, ...]
+  total_score: float

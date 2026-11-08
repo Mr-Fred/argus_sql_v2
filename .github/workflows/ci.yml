@@ -1,0 +1,87 @@
+name: Argus-SQL Hermetic Clean-Room CI
+
+on:
+  push:
+    branches:
+      - main
+      - "feat/**"
+      - "fix/**"
+      - "feedback/**"
+  pull_request:
+    branches:
+      - main
+
+# Enforce strict least-privilege read-only token permissions across all jobs.
+permissions:
+  contents: read
+
+jobs:
+  clean_room_and_feedback_gate:
+    name: Clean-Room IP, Secret, AST & Feedback Bundle Gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Bootstrap clean Git hooks & run full repository guardrail audit
+        env:
+          PYTHONPATH: src
+        run: |
+          python3 -m argus_sql.guardrails.cli --bootstrap-git --verify-all
+
+      - name: Verify SHA-256 integrity & leak-free schema of committed feedback bundles
+        env:
+          PYTHONPATH: src
+        run: |
+          python3 -m argus_sql.evaluation.feedback_cli verify --feedback-dir results/feedback
+
+  hermetic_test_matrix:
+    name: Hermetic Unit Tests & Diagnostic Reproducibility (${{ matrix.os }}, Py ${{ matrix.python-version }})
+    needs: clean_room_and_feedback_gate
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest]
+        python-version: ["3.11", "3.12", "3.13"]
+        include:
+          - os: windows-latest
+            python-version: "3.12"
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Configure local clean-room Git hooks & run guardrail audit
+        env:
+          PYTHONPATH: src
+        run: python -m argus_sql.guardrails.cli --bootstrap-git --verify-all
+
+      - name: Run full hermetic unit test suite (zero external network calls)
+        env:
+          PYTHONPATH: src
+        run: python -m unittest discover -s src -p "*_test.py" -v
+
+      - name: Verify deterministic Mini-BIRD & Voice-BIRD ablation reproduction
+        env:
+          PYTHONPATH: src
+        run: >-
+          python -c "import pathlib, tempfile; from argus_sql.evaluation.cli import main;
+          tmp = tempfile.TemporaryDirectory(); root = pathlib.Path(tmp.name);
+          rc = main(['--mode', 'diagnostic', '--latex-out-dir', str(root / 'tables'), '--json-out-dir', str(root / 'results')]);
+          assert rc == 0;
+          assert (root / 'tables' / 'diagnostic_main.tex').stat().st_size > 0;
+          assert (root / 'tables' / 'diagnostic_ablation.tex').stat().st_size > 0;
+          assert (root / 'results' / 'diagnostic_benchmark.json').stat().st_size > 0;
+          tmp.cleanup()"

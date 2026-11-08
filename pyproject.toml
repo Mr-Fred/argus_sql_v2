@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "argus-sql"
+version = "0.1.0"
+description = "Argus-SQL: Composable Research Framework for High-Accuracy, Low-Latency Natural Language and Voice-to-SQL"
+readme = "README.md"
+requires-python = ">=3.11"
+license = {text = "Apache-2.0"}
+authors = [
+  {name = "Independent Researcher", email = "researcher@users.noreply.github.com"}
+]
+keywords = ["nl2sql", "text-to-sql", "voice-to-sql", "bird-sql", "database", "llm", "benchmark"]
+dependencies = []
+
+[project.optional-dependencies]
+dev = [
+  "ruff>=0.6.0",
+]
+
+[project.scripts]
+argus-guardrails = "argus_sql.guardrails.cli:main"
+argus-ablation = "argus_sql.evaluation.cli:main"
+argus-feedback = "argus_sql.evaluation.feedback_cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]

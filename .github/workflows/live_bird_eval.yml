@@ -1,0 +1,113 @@
+name: Manual Live BIRD Evaluation (Personal Cloud / API)
+
+# Triggered strictly manually in the personal GitHub repository when desired.
+on:
+  workflow_dispatch:
+    inputs:
+      provider:
+        description: "LLM transport provider (openai or vertex)"
+        required: true
+        default: "openai"
+        type: choice
+        options:
+          - openai
+          - vertex
+      model:
+        description: "Model identifier (e.g., gemini-2.5-flash or gpt-4o)"
+        required: true
+        default: "gpt-4o-mini"
+        type: string
+      limit:
+        description: "Task cap (0 evaluates full split; 20 runs fast smoke test)"
+        required: true
+        default: "20"
+        type: string
+      only_argus:
+        description: "Evaluate only Argus-SQL (skip B0..B3 baselines)"
+        required: true
+        default: true
+        type: boolean
+      bird_archive_url:
+        description: "Optional public HTTPS URL to MINIDEV.zip archive"
+        required: false
+        default: ""
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  live_bird_feedback_export:
+    name: Run Live BIRD Slice & Export Sanitized Feedback Bundle
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Bootstrap local clean-room Git hooks
+        env:
+          PYTHONPATH: src
+        run: |
+          python3 -m argus_sql.guardrails.cli --bootstrap-git
+
+      - name: Download public BIRD Mini-Dev archive when URL is supplied
+        if: ${{ inputs.bird_archive_url != '' }}
+        env:
+          BIRD_URL: ${{ inputs.bird_archive_url }}
+        run: |
+          case "${BIRD_URL}" in
+            https://*) ;;
+            *) echo "[ERROR] bird_archive_url must use https://" >&2; exit 1 ;;
+          esac
+          mkdir -p data/bird/mini_dev
+          curl --fail --location --silent --show-error "${BIRD_URL}" -o /tmp/minidev.zip
+          unzip -q /tmp/minidev.zip -d data/bird/mini_dev
+          rm -f /tmp/minidev.zip
+
+      - name: Execute live BIRD evaluation and emit sanitized feedback bundle
+        env:
+          PYTHONPATH: src
+          ARGUS_LLM_API_KEY: ${{ secrets.ARGUS_LLM_API_KEY }}
+          GOOGLE_CLOUD_PROJECT: ${{ secrets.PERSONAL_GCP_PROJECT }}
+          GOOGLE_CLOUD_LOCATION: global
+          INPUT_PROVIDER: ${{ inputs.provider }}
+          INPUT_MODEL: ${{ inputs.model }}
+          INPUT_LIMIT: ${{ inputs.limit }}
+          INPUT_ONLY_ARGUS: ${{ inputs.only_argus }}
+        run: |
+          EXTRA_ARGS=()
+          if [ "${INPUT_ONLY_ARGUS}" = "true" ]; then
+            EXTRA_ARGS+=("--only-argus")
+          fi
+          python3 -m argus_sql.evaluation.cli \
+            --mode bird \
+            --provider "${INPUT_PROVIDER}" \
+            --model "${INPUT_MODEL}" \
+            --bird-dir data/bird/mini_dev \
+            --questions-filename mini_dev_sqlite.json \
+            --limit "${INPUT_LIMIT}" \
+            "${EXTRA_ARGS[@]}"
+
+      - name: Verify clean-room compliance & SHA-256 digest of exported bundle
+        env:
+          PYTHONPATH: src
+        run: |
+          python3 -m argus_sql.guardrails.cli --scan-path results/feedback
+          python3 -m argus_sql.guardrails.cli --scan-path paper/tables/bird_live.tex
+          python3 -m argus_sql.evaluation.feedback_cli verify --feedback-dir results/feedback
+
+      - name: Upload sanitized feedback bundle & triage report artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: argus-bird-feedback-bundle
+          retention-days: 30
+          path: |
+            results/feedback/bird_feedback_bundle.json
+            results/feedback/triage_report.md
+            paper/tables/bird_live.tex

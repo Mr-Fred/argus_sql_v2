@@ -1,0 +1,52 @@
+# Bytecode & Python packaging artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+.eggs/
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Environment & local secrets (NEVER commit credentials)
+.env
+.env.*
+*.pem
+*.key
+*secret*
+
+# External benchmark downloads & temporary SQLite artifacts
+data/bird/
+data/spider/
+*.sqlite-journal
+*.sqlite-wal
+*.sqlite-shm
+results/live_runs/
+results/bird_live_benchmark.json
+
+# LaTeX auxiliary build files (keep main.tex, references.bib, tables/*.tex, and main.pdf)
+paper/*.aux
+paper/*.bbl
+paper/*.blg
+paper/*.fdb_latexmk
+paper/*.fls
+paper/*.log
+paper/*.out
+paper/*.synctex.gz
+paper/*.toc
+
+# Local IDE workspace metadata (Antigravity IDE, VS Code, JetBrains) & OS cruft
+.antigravity/
+.gemini/
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+Desktop.ini
+*.swp
+*.tmp
+audit_import/

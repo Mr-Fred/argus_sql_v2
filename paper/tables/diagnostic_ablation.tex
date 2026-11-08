@@ -1,0 +1,20 @@
+\begin{table*}[t]
+\centering
+\small
+\caption{Leave-one-out component ablation study of Argus-SQL across Clean and Voice-BIRD diagnostic splits, isolating each module's impact on Execution Accuracy (EX), R-VES, and prompt token budget.}
+\label{tab:diagnostic_ablation}
+\resizebox{\textwidth}{!}{%
+\begin{tabular}{lccccccc}
+\toprule
+\textbf{System / Configuration} & \textbf{Simple EX} & \textbf{Mod.\ EX} & \textbf{Chall.\ EX} & \textbf{Clean EX (\%)} & \textbf{Clean R-VES} & \textbf{Voice EX (\%)} & \textbf{Mean Tokens} \\
+\midrule
+\textbf{Argus-SQL} & \textbf{100.0} & \textbf{100.0} & \textbf{100.0} & \textbf{100.0} & \textbf{100.0} & \textbf{100.0} & 662 \\
+w/o Voice Canonicalizer & 100.0 & 100.0 & 100.0 & 100.0 & 100.0 & 70.8 & 726 \\
+w/o 3-Gram Value Grounding & 100.0 & 75.0 & 50.0 & 75.0 & 75.0 & 62.5 & 626 \\
+w/o Steiner FK Closure & 100.0 & 62.5 & 50.0 & 70.8 & 70.8 & 70.8 & 729 \\
+w/o Semantic Verifier \& Repair & 100.0 & 62.5 & 0.0 & 54.2 & 54.2 & 54.2 & 662 \\
+w/o Adaptive Fast-Path (Fixed K=3) & 100.0 & 100.0 & 100.0 & 100.0 & 100.0 & 100.0 & 726 \\
+\bottomrule
+\end{tabular}%
+}
+\end{table*}
