@@ -12,7 +12,9 @@ SQLITE_SYSTEM_PROMPT = (
     "You are an expert relational database engineer specializing in SQLite. "
     "Given a CREATE TABLE schema, optional External Evidence formulas, and a "
     "user Question, output a single valid read-only SQLite SELECT statement "
-    "inside a ```sql ... ``` code block."
+    "inside a ```sql ... ``` code block. Follow External Evidence equations "
+    "and string-slicing rules verbatim, check PRIMARY KEY grain before "
+    "aggregating, and inspect column examples/matched_values for exact formats."
 )
 
 
@@ -42,26 +44,31 @@ def build_strategy_request(
 
   # Tailor reasoning instructions to encourage genuine candidate diversity.
   if strategy_tag == "decomposed_cot":
-    # Emphasizes multi-hop foreign-key path planning (DIN-SQL style).
+    # Emphasizes multi-hop foreign-key path & PRIMARY KEY grain planning.
     guidance = (
-        "Decompose step-by-step: (1) identify required tables and FK join "
-        "paths, (2) verify exact string literals from matched_values, "
-        "(3) write the final SQLite SELECT query."
+        "Decompose step-by-step: (1) identify required tables, FK join paths, "
+        "and composite PRIMARY KEY table grain (use GROUP BY + SUM when rows "
+        "are per-entity-period), (2) verify exact date/code formats from "
+        "matched_values and examples, (3) translate External Evidence formulas "
+        "and SUBSTR rules literally into the final SQLite SELECT query."
     )
   elif strategy_tag == "formula_defensive":
-    # Emphasizes explicit SQLite REAL division and NULL-sort defenses.
+    # Emphasizes explicit SQLite REAL division, NULL-sort, and DISTINCT guards.
     guidance = (
         "Enforce SQLite defensive invariants: promote ratios using "
         "CAST(numerator AS REAL) / NULLIF(denominator, 0), filter NULLs "
-        "with IS NOT NULL before ORDER BY ... ASC LIMIT, and bind exact "
-        "matched_values literals."
+        "with IS NOT NULL before ORDER BY ... ASC LIMIT, follow External "
+        "Evidence formulas/SUBSTR slices verbatim, use SELECT DISTINCT when "
+        "listing unique entities across 1-to-many joins, and bind exact "
+        "matched_values/examples literals."
     )
   elif strategy_tag == "skeleton_minimal":
-    # Emphasizes projection arity discipline and minimal relational clauses.
+    # Emphasizes projection arity discipline and direct evidence translation.
     guidance = (
         "Draft the minimal relational SQL skeleton (SELECT ... FROM ... JOIN "
-        "... WHERE ...) projecting only the exact columns requested, then "
-        "fill column identifiers from the DDL."
+        "... WHERE ...) projecting only the exact columns requested, apply "
+        "External Evidence formulas directly without extra nested CTEs unless "
+        "required, and fill exact column names and literals from the DDL."
     )
   else:
     # Default zero-shot directive keeps prompt overhead minimal for baselines.

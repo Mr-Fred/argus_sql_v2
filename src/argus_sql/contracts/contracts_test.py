@@ -83,6 +83,31 @@ class ContractsAndDDLTest(unittest.TestCase):
     assert resolved is not None
     self.assertEqual(resolved.name, "schools")
 
+  def test_renders_composite_primary_key_as_valid_sqlite_table_constraint(
+      self,
+  ) -> None:
+    """Multi-column primary keys render as `PRIMARY KEY (c1, c2)` table DDL."""
+    import sqlite3
+
+    # Mirror `yearmonth(CustomerID, Date)` composite grain from BIRD-SQL.
+    ym = TableSchema(
+        name="yearmonth",
+        columns=(
+            ColumnSchema("CustomerID", "INTEGER", is_primary_key=True),
+            ColumnSchema("Date", "TEXT", is_primary_key=True),
+            ColumnSchema("Consumption", "REAL"),
+        ),
+    )
+    ddl = render_schema_ddl(DatabaseSchema(db_id="debit", tables=(ym,)))
+    self.assertIn("PRIMARY KEY (CustomerID, Date)", ddl)
+    self.assertNotIn("CustomerID INTEGER PRIMARY KEY", ddl)
+    # Confirm rendered DDL executes cleanly in SQLite without duplicate-PK error.
+    conn = sqlite3.connect(":memory:")
+    try:
+      conn.executescript(ddl)
+    finally:
+      conn.close()
+
 
 if __name__ == "__main__":
   unittest.main()

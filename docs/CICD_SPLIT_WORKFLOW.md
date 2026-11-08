@@ -74,6 +74,7 @@ On your **personal Windows PC (inside Antigravity IDE or PowerShell)** or macOS/
 
      Copy-Item config\personal_env.example .env
      notepad .env
+     # Defaults to GOOGLE_CLOUD_LOCATION=global and ARGUS_LLM_MODEL=gemini-3.7-flash.
      # If using Vertex AI on Windows, authenticate locally (writes %APPDATA%\gcloud\application_default_credentials.json):
      gcloud auth application-default login
      ```
@@ -87,17 +88,27 @@ On your **personal Windows PC (inside Antigravity IDE or PowerShell)** or macOS/
      ```
    - **Copy-Paste Prompt for Your Windows Antigravity Agent** (after setting `.env` / `gcloud` locally):
      ```text
-     Read docs/CICD_SPLIT_WORKFLOW.md and AGENTS.md. Verify that data/bird/mini_dev is unpacked and local .env / gcloud ADC is ready (never print secret values). Run .\scripts\run_personal_eval.ps1 -Limit 20 -OnlyArgus first to validate live connectivity and inspect results/feedback/triage_report.md. Once verified, run the full evaluation (.\scripts\run_personal_eval.ps1), confirm zero clean-room leaks and valid SHA-256 signatures, and commit/push ONLY results/feedback/bird_feedback_bundle.json, results/feedback/triage_report.md, and paper/tables/bird_live.tex to main.
+     Read docs/CICD_SPLIT_WORKFLOW.md and AGENTS.md. Verify that data/bird/mini_dev is unpacked and local .env / gcloud ADC is ready on GOOGLE_CLOUD_LOCATION=global using gemini-3.7-flash (never print secret values). Run .\scripts\run_personal_eval.ps1 -Limit 20 -OnlyArgus first to validate live connectivity and inspect results/feedback/triage_report.md. Once verified, run the full evaluation (.\scripts\run_personal_eval.ps1), confirm zero clean-room leaks and valid SHA-256 signatures, and commit/push ONLY results/feedback/bird_feedback_bundle.json, results/feedback/triage_report.md, and paper/tables/bird_live.tex to main.
      ```
 
-2. **macOS / Linux / Git Bash** — Equivalent POSIX commands:
+2. **Antigravity Remote Linux VM / macOS / POSIX Bash** — Native Linux commands (often faster for downloading the 1.3 GB BIRD SQLite archive directly over VM cloud bandwidth):
    ```bash
+   # 1. Pull latest clean-room code and configure your local gitignored .env
+   #    (defaults to GOOGLE_CLOUD_LOCATION=global and ARGUS_LLM_MODEL=gemini-3.7-flash):
    git pull origin main
    cp config/personal_env.example .env
-   gcloud auth application-default login
+
+   # 2. On a headless remote Linux VM, use --no-launch-browser for personal ADC:
+   gcloud auth application-default login --no-launch-browser
+
+   # 3. Run a 20-query smoke slice first, then the full 500-query Mini-Dev split:
    ARGUS_LIMIT=20 ./scripts/run_personal_eval.sh --only-argus
    ./scripts/run_personal_eval.sh
    ```
+   - **Copy-Paste Prompt for Your Antigravity Remote Linux VM Agent**:
+     ```text
+     Read docs/CICD_SPLIT_WORKFLOW.md and AGENTS.md. Verify that data/bird/mini_dev (mini_dev_sqlite.json, dev_tables.json, and dev_databases/*.sqlite) is staged and local .env / gcloud ADC is ready on GOOGLE_CLOUD_LOCATION=global using gemini-3.7-flash (never print secret values). Run `ARGUS_LIMIT=20 ./scripts/run_personal_eval.sh --only-argus` first to validate live connectivity and inspect results/feedback/triage_report.md. Once verified, run the full evaluation (`./scripts/run_personal_eval.sh`), confirm zero clean-room leaks and valid SHA-256 signatures, and commit/push ONLY results/feedback/bird_feedback_bundle.json, results/feedback/triage_report.md, and paper/tables/bird_live.tex to main.
+     ```
 
 3. `run_personal_eval.ps1` / `run_personal_eval.sh` automatically:
    - Scrubs Windows (`C:\Users\...`, `C:\\Users\\...`, `file:///C:/Users/...`) and POSIX workstation paths plus credential patterns from SQL error summaries,

@@ -77,7 +77,7 @@ def normalize_gemini_model_name(model_name: str) -> str:
     model_name: Raw model identifier or `publishers/google/models/...` resource.
 
   Returns:
-    Validated bare Gemini model slug (e.g., `'gemini-2.5-flash'`).
+    Validated bare Gemini model slug (e.g., `'gemini-3.7-flash'`).
 
   Raises:
     LLMAdapterAuthError: If the normalized model name contains unsafe characters.

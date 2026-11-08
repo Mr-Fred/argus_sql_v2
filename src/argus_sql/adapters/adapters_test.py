@@ -75,25 +75,25 @@ class AdaptersModuleTest(unittest.TestCase):
     """Vertex URLs block traversal, skip thought parts, and deduplicate batches."""
     # Global Gemini Enterprise routing must hit `aiplatform.googleapis.com`.
     global_url = build_vertex_generate_url(
-        "demo-eval-project-01", "global", "google/gemini-2.5-flash"
+        "demo-eval-project-01", "global", "google/gemini-3.7-flash"
     )
     self.assertEqual(
         global_url,
         "https://aiplatform.googleapis.com/v1beta1/projects/"
         "demo-eval-project-01/locations/global/publishers/google/"
-        "models/gemini-2.5-flash:generateContent",
+        "models/gemini-3.7-flash:generateContent",
     )
     # Regional routing must prepend `<region>-` to `aiplatform.googleapis.com`.
     regional_url = build_vertex_generate_url(
-        "demo-eval-project-01", "us-central1", "gemini-2.5-pro"
+        "demo-eval-project-01", "us-central1", "gemini-3.7-pro"
     )
     self.assertIn("https://us-central1-aiplatform.googleapis.com/", regional_url)
 
     # Reject path traversal or malformed project/location/model identifiers.
     with self.assertRaises(LLMAdapterAuthError):
-      build_vertex_generate_url("../bad-project", "global", "gemini-2.5-flash")
+      build_vertex_generate_url("../bad-project", "global", "gemini-3.7-flash")
     with self.assertRaises(LLMAdapterAuthError):
-      build_vertex_generate_url("demo-eval-project-01", "bad/loc", "gemini-2.5")
+      build_vertex_generate_url("demo-eval-project-01", "bad/loc", "gemini-3.7")
     with self.assertRaises(LLMAdapterAuthError):
       build_vertex_generate_url("demo-eval-project-01", "global", "bad?model=1")
 
@@ -119,6 +119,20 @@ class AdaptersModuleTest(unittest.TestCase):
     self.assertEqual(p_tok, 120)
     self.assertEqual(c_tok, 60)
 
+    # Truncated thought-only responses must never leak internal draft SQL.
+    thought_only_body: dict[str, object] = {
+        "candidates": [{
+            "content": {
+                "parts": [{"thought": True, "text": "SELECT wrong_table FROM draft;"}]
+            },
+            "finishReason": "MAX_TOKENS",
+        }],
+        "usageMetadata": {"promptTokenCount": 80, "thoughtsTokenCount": 2048},
+    }
+    trunc_txt, _, trunc_c_tok = extract_gemini_completion_triple(thought_only_body, 320)
+    self.assertEqual(trunc_txt, "")
+    self.assertEqual(trunc_c_tok, 2048)
+
     # Verify batch deduplication executes only 1 upstream call for 2 identical reqs.
     token_calls = 0
 
@@ -131,7 +145,7 @@ class AdaptersModuleTest(unittest.TestCase):
     # Construct client with injected hermetic token supplier (zero network I/O).
     client = VertexGeminiBatchClient(
         project_id="demo-eval-project-01",
-        model_name="gemini-2.5-flash",
+        model_name="gemini-3.7-flash",
         location="global",
         token_supplier=_fake_token,
     )
@@ -166,13 +180,17 @@ class AdaptersModuleTest(unittest.TestCase):
           "GOOGLE_CLOUD_LOCATION=global\n",
           encoding="utf-8",
       )
-      # Confirm `provider='auto'` selects `VertexGeminiBatchClient` automatically.
+      # Confirm `provider='auto'` selects `VertexGeminiBatchClient` automatically
+      # with `gemini-3.7-flash` on the `global` endpoint by default.
       with mock.patch.dict("os.environ", {}, clear=True):
         cfg = load_dotenv_defaults(env_file)
         self.assertEqual(cfg["GOOGLE_CLOUD_PROJECT"], "demo-eval-project-01")
         routed = build_live_llm_client(provider="auto", dotenv_path=env_file)
         self.assertIsInstance(routed, VertexGeminiBatchClient)
-        self.assertEqual(getattr(routed, "provider_name", ""), "vertex")
+        assert isinstance(routed, VertexGeminiBatchClient)
+        self.assertEqual(routed.provider_name, "vertex")
+        self.assertEqual(routed.location, "global")
+        self.assertEqual(routed.model_name, "gemini-3.7-flash")
 
       # Unedited template placeholder without API key must fail closed on Vertex.
       placeholder_env = Path(tmp_dir) / "placeholder.env"
@@ -212,7 +230,7 @@ class AdaptersModuleTest(unittest.TestCase):
     tokens = iter([("expired-tok", 3600.0), ("fresh-tok", 3600.0)])
     client = VertexGeminiBatchClient(
         project_id="demo-eval-project-01",
-        model_name="gemini-2.5-flash",
+        model_name="gemini-3.7-flash",
         token_supplier=lambda: next(tokens),
     )
     ok_body: dict[str, object] = {
@@ -241,10 +259,14 @@ class AdaptersModuleTest(unittest.TestCase):
       res = client.batch_complete((req,))
     self.assertEqual(res[0].sql_text, "SELECT 1")
     self.assertEqual(seen_tokens, ["expired-tok", "fresh-tok"])
-    # `systemInstruction` must omit `"role": "system"` for strict Vertex routers.
+    # `systemInstruction` must omit `"role": "system"` for strict Vertex routers,
+    # and `generationConfig.maxOutputTokens` must honor the 8192 thinking floor.
     sys_inst = seen_payloads[0]["systemInstruction"]
     assert isinstance(sys_inst, dict)
     self.assertNotIn("role", sys_inst)
+    gen_cfg = seen_payloads[0]["generationConfig"]
+    assert isinstance(gen_cfg, dict)
+    self.assertGreaterEqual(int(gen_cfg["maxOutputTokens"]), 8192)
 
   def test_windows_appdata_adc_discovery_and_gcloud_cmd_fallback(self) -> None:
     """Windows `%APPDATA%\\gcloud` ADC and `gcloud.cmd` resolve cleanly."""

@@ -27,9 +27,10 @@ def _quote_sql_identifier(identifier: str) -> str:
 def _format_column_line(
     col: ColumnSchema,
     grounded_literals: Sequence[str],
+    inline_pk: bool = True,
 ) -> str:
   """Formats a single column declaration with inline comment annotations."""
-  pk_suffix = " PRIMARY KEY" if col.is_primary_key else ""
+  pk_suffix = " PRIMARY KEY" if (col.is_primary_key and inline_pk) else ""
   col_decl = f"  {_quote_sql_identifier(col.name)} {col.data_type}{pk_suffix}"
 
   # Combine column description, grounded query matches, and sample literals.
@@ -99,6 +100,11 @@ def render_schema_ddl(
       continue
     included_tables.add(tbl_lower)
 
+    # Emit composite multi-column PKs as a table constraint so SQLite DDL stays
+    # syntactically valid and makes composite row grain explicit to the LLM.
+    pk_cols = [col for col in table.columns if col.is_primary_key]
+    is_composite_pk = len(pk_cols) >= 2
+
     # Filter columns according to `selected_columns` while preserving PKs.
     allowed_cols = allow_map[tbl_lower] if allow_map is not None else None
     col_lines: list[str] = []
@@ -110,22 +116,28 @@ def render_schema_ddl(
       ):
         continue
       hits = grounded_index.get((tbl_lower, col.name.lower()), ())
-      col_lines.append(_format_column_line(col, hits))
+      col_lines.append(
+          _format_column_line(col, hits, inline_pk=not is_composite_pk)
+      )
 
-    # Append explicit FOREIGN KEY clauses so join keys are unmistakable.
+    # Append composite PRIMARY KEY (...) and explicit FOREIGN KEY clauses.
+    constraint_lines: list[str] = []
+    if is_composite_pk:
+      pk_list = ", ".join(_quote_sql_identifier(c.name) for c in pk_cols)
+      constraint_lines.append(f"  PRIMARY KEY ({pk_list})")
+
     # Only emit FK edges whose target table also survived schema pruning.
-    fk_lines: list[str] = []
     for edge in active_edges:
       if edge.source_table.lower() == tbl_lower:
         if allow_map is None or edge.target_table.lower() in allow_map:
-          fk_lines.append(
+          constraint_lines.append(
               f"  FOREIGN KEY ({_quote_sql_identifier(edge.source_column)}) "
               f"REFERENCES {_quote_sql_identifier(edge.target_table)}"
               f"({_quote_sql_identifier(edge.target_column)})"
           )
 
     # Assemble single-table CREATE TABLE block in canonical schema order.
-    body = ",\n".join(col_lines + fk_lines)
+    body = ",\n".join(col_lines + constraint_lines)
     rendered_blocks.append(
         f"CREATE TABLE {_quote_sql_identifier(table.name)} (\n{body}\n);"
     )

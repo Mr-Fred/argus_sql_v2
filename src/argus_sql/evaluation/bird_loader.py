@@ -5,7 +5,6 @@ Loads standard public BIRD-SQL dev / mini-dev JSON specifications (`dev.json`,
 directory traversal validation, and synthesizes reproducible spoken utterances.
 """
 
-import csv
 import json
 import pathlib
 import re
@@ -16,6 +15,8 @@ from argus_sql.contracts.types import ForeignKeyEdge
 from argus_sql.contracts.types import NLQueryTask
 from argus_sql.contracts.types import QueryDifficulty
 from argus_sql.contracts.types import TableSchema
+from argus_sql.evaluation.bird_metadata import load_column_descriptions
+from argus_sql.evaluation.bird_metadata import load_sqlite_column_examples
 from argus_sql.evaluation.exceptions import BenchmarkDatasetError
 
 # Digits mapped to spoken ASR words during Voice-BIRD utterance perturbation.
@@ -84,37 +85,6 @@ def perturb_task_for_voice(task: NLQueryTask) -> NLQueryTask:
       gold_sql=task.gold_sql,
       is_voice_perturbed=True,
   )
-
-
-def _load_column_descriptions(db_dir: pathlib.Path) -> dict[tuple[str, str], str]:
-  """Reads optional BIRD `database_description/*.csv` metadata safely."""
-  desc_dir = db_dir / "database_description"
-  if not desc_dir.is_dir():
-    return {}
-
-  # Scan CSV metadata files without following symlinks outside `db_dir`.
-  descriptions: dict[tuple[str, str], str] = {}
-  for csv_file in sorted(desc_dir.glob("*.csv")):
-    if csv_file.is_symlink():
-      continue
-    tbl_lower = csv_file.stem.lower()
-    try:
-      # Use `utf-8-sig` so official BIRD CSVs prefixed with a `\ufeff` UTF-8 BOM
-      # expose `original_column_name` cleanly instead of `\ufefforiginal_column_name`.
-      with csv_file.open("r", encoding="utf-8-sig", errors="replace") as handle:
-        reader = csv.DictReader(handle)
-        for row in reader:
-          col_name = (
-              row.get("original_column_name") or row.get("column_name") or ""
-          ).strip()
-          desc = (
-              row.get("column_description") or row.get("value_description") or ""
-          ).strip()
-          if col_name and desc:
-            descriptions[(tbl_lower, col_name.lower())] = desc[:140]
-    except OSError:
-      continue
-  return descriptions
 
 
 def _parse_questions_payload(raw_text: str) -> list[dict[str, object]]:
@@ -250,11 +220,18 @@ def load_bird_split(
     if sqlite_file.is_file():
       sqlite_paths[db_id] = sqlite_file
 
-    # Merge optional CSV column descriptions into physical table schemas.
-    col_descs = _load_column_descriptions(db_folder)
+    # Merge CSV codebook descriptions and optional SQLite sample literals.
+    col_descs = load_column_descriptions(db_folder)
     t_names: list[str] = list(entry["table_names_original"])
     c_entries: list[list[object]] = list(entry["column_names_original"])
     c_types: list[str] = [str(t).upper() for t in entry.get("column_types", [])]
+    raw_col_names_by_tbl: dict[str, list[str]] = {t: [] for t in t_names}
+    for pair in c_entries:
+      t_idx = int(pair[0])  # type: ignore[arg-type]
+      if 0 <= t_idx < len(t_names):
+        raw_col_names_by_tbl[t_names[t_idx]].append(str(pair[1]))
+    col_examples = load_sqlite_column_examples(sqlite_file, raw_col_names_by_tbl)
+
     # Flatten both scalar PK indices and composite `[col_a, col_b]` PK lists.
     pk_flat: set[int] = set()
     for pk_item in entry.get("primary_keys", []):
@@ -271,13 +248,16 @@ def load_bird_split(
       if t_idx < 0 or t_idx >= len(t_names):
         continue
       dtype = c_types[col_idx] if col_idx < len(c_types) else "TEXT"
-      desc = col_descs.get((t_names[t_idx].lower(), c_name.lower()), "")
+      lookup_key = (t_names[t_idx].lower(), c_name.lower())
+      desc = col_descs.get(lookup_key, "")
+      examples = col_examples.get(lookup_key, ())
       cols_per_table[t_idx].append(
           ColumnSchema(
               name=c_name,
               data_type=dtype,
               is_primary_key=(col_idx in pk_flat),
               description=desc,
+              value_examples=examples,
           )
       )
 

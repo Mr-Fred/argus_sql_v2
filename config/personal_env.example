@@ -12,7 +12,7 @@
 GOOGLE_GENAI_USE_VERTEXAI=TRUE
 GOOGLE_CLOUD_PROJECT=your-personal-gcp-project-id
 GOOGLE_CLOUD_LOCATION=global
-ARGUS_LLM_MODEL=gemini-2.5-flash
+ARGUS_LLM_MODEL=gemini-3.7-flash
 
 # Option B — OpenAI-Compatible HTTPS or Local vLLM Endpoint (`127.0.0.1`):
 # ARGUS_LLM_API_KEY=your-personal-api-key-on-laptop-only

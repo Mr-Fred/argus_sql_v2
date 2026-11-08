@@ -16,7 +16,7 @@
     .\scripts\run_personal_eval.ps1 -Limit 20 -OnlyArgus
 
 .EXAMPLE
-    .\scripts\run_personal_eval.ps1 -Provider vertex -Model gemini-2.5-flash
+    .\scripts\run_personal_eval.ps1 -Provider vertex -Model gemini-3.7-flash
 #>
 [CmdletBinding()]
 param(

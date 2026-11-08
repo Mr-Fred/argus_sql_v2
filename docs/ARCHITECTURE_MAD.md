@@ -51,7 +51,7 @@ argus_sql/
 ├── paper/
 │   ├── main.tex                      # Camera-ready 2-column research manuscript
 │   ├── references.bib                # Public peer-reviewed & arXiv bibliography
-│   ├── main.pdf                      # Compiled 6-page PDF manuscript
+│   ├── main.pdf                      # Compiled camera-ready PDF manuscript
 │   └── tables/
 │       ├── diagnostic_main.tex       # Auto-generated B0..B3 vs Argus-SQL table
 │       └── diagnostic_ablation.tex   # Auto-generated leave-one-out ablation table
@@ -60,13 +60,13 @@ argus_sql/
 │   └── feedback/                     # SHA-256-verified sanitized feedback bundles
 └── src/argus_sql/
     ├── guardrails/                   # Clean-room IP/secret scanner & AST verifier
-    ├── contracts/                    # Pure domain dataclasses & DDL serializer
-    ├── linking/                      # Voice canonicalizer, 3-gram index & FK BFS
+    ├── contracts/                    # Pure domain dataclasses & composite-PK DDL
+    ├── linking/                      # Voice canon., 3-gram/code index & FK/junction graph
     ├── sandbox/                      # Read-only authorizer-locked SQLite sandbox
-    ├── verification/                 # 6 SQLite invariants, algebraic repair & vote
-    ├── adapters/                     # Batch HTTPS LLM client & DDL synthesizer
+    ├── verification/                 # 7 SQLite invariants, algebraic repair & vote
+    ├── adapters/                     # Vertex/OpenAI batch HTTPS & DDL synthesizer
     ├── pipelines/                    # B0, B1, B2, B3 baselines & Argus-SQL hybrid
-    └── evaluation/                   # BIRD EX, R-VES, feedback bundles & triage
+    └── evaluation/                   # BIRD EX/R-VES, CSV/SQLite hydration & triage
 ```
 
 ---

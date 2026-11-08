@@ -13,10 +13,13 @@ from argus_sql.contracts.types import InvariantIssue
 from argus_sql.contracts.types import LinkedSchemaContext
 from argus_sql.contracts.types import SQLCandidate
 
-# Matches floating-point cast or real promotion idioms in SQLite divisions,
-# including nested aggregates (`CAST(SUM(x) AS REAL)`).
+# Matches floating-point cast, AVG/TOTAL real aggregates, or float-literal
+# promotion idioms (`* 100.0`, `100.0 *`, `/ 12.0`) in SQLite divisions.
 _FLOAT_PROMOTION_RE = re.compile(
-    r"\bCAST\s*\([\s\S]+?\bAS\s+(?:REAL|FLOAT|DOUBLE)\s*\)|1\.0\s*\*|\*\s*1\.0|100\.0\s*\*",
+    r"\bCAST\s*\([\s\S]+?\bAS\s+(?:REAL|FLOAT|DOUBLE)\s*\)"
+    r"|\b(?:AVG|TOTAL)\s*\("
+    r"|\b\d+\.\d+\s*[*/]"
+    r"|[*/]\s*\d+\.\d+",
     re.IGNORECASE,
 )
 
@@ -24,6 +27,13 @@ _FLOAT_PROMOTION_RE = re.compile(
 # backtick/double-quoted column identifiers (`T1.`Enrollment (K-12)``).
 _ORDER_ASC_LIMIT_RE = re.compile(
     r"\bORDER\s+BY\s+((?:[a-zA-Z0-9_]+\.)?(?:`[^`]+`|\"[^\"]+\"|[a-zA-Z0-9_.]+))(?:\s+(ASC|DESC))?\s+LIMIT\s+\d+",
+    re.IGNORECASE,
+)
+
+# Detects aggregate/dedup/ordered SQL clauses that intentionally shape row count.
+_DEDUP_OR_AGG_SQL_RE = re.compile(
+    r"\b(?:DISTINCT|GROUP\s+BY|ORDER\s+BY|UNION|INTERSECT|EXCEPT|LIMIT|COUNT\s*\("
+    r"|SUM\s*\(|AVG\s*\(|MIN\s*\(|MAX\s*\(|TOTAL\s*\()\b",
     re.IGNORECASE,
 )
 
@@ -178,6 +188,7 @@ def audit_candidate_invariants(
   if (
       outcome.row_count > 0
       and actual_arity > 0
+      and intent.expected_projection_arity > 0
       and abs(actual_arity - intent.expected_projection_arity) >= 2
   ):
     issues.append(
@@ -193,5 +204,30 @@ def audit_candidate_invariants(
             ),
         )
     )
+
+  # 7. Detect unintended 1-to-many join fanout duplicates on entity listings.
+  if (
+      outcome.row_count >= 5
+      and re.search(r"\bJOIN\b", no_quotes_sql, re.IGNORECASE) is not None
+      and _DEDUP_OR_AGG_SQL_RE.search(no_quotes_sql) is None
+      and not re.search(
+          r"\b(?:every|each\s+row|all\s+transactions|all\s+records)\b",
+          intent.canonical_question,
+          re.IGNORECASE,
+      )
+  ):
+    unique_count = len(set(outcome.rows))
+    if unique_count < outcome.row_count and (unique_count / outcome.row_count) <= 0.5:
+      issues.append(
+          InvariantIssue(
+              code="JOIN_FANOUT_DUPLICATES",
+              severity="WARNING",
+              message=(
+                  f"Multi-table JOIN returned {outcome.row_count} rows with "
+                  f"only {unique_count} unique tuple(s) without DISTINCT."
+              ),
+              repair_hint="Use `SELECT DISTINCT` to deduplicate 1-to-many joins.",
+          )
+      )
 
   return tuple(issues)

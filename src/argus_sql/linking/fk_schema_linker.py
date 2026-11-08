@@ -1,13 +1,11 @@
 """Value-grounded Steiner Foreign-Key closure schema linker.
 
-Combines lexical + evidence column scoring, 3-gram database cell-value matches,
-and Breadth-First Shortest-Path Foreign-Key closure so pruned schemas never
-drop intermediate bridge tables required for valid multi-hop SQL joins.
+Combines compound-aware morphological column scoring, 3-gram database cell-value
+matches, implicit PK-column foreign-key inference, and all-pairs Steiner +
+junction bridge closure so schemas retain join paths and measure columns cleanly.
 """
 
-from collections import deque
 from collections.abc import Sequence
-import re
 
 from argus_sql.contracts.schema_ddl_renderer import render_schema_ddl
 from argus_sql.contracts.types import DatabaseSchema
@@ -15,58 +13,12 @@ from argus_sql.contracts.types import ForeignKeyEdge
 from argus_sql.contracts.types import IntentFrame
 from argus_sql.contracts.types import LinkedSchemaContext
 from argus_sql.contracts.types import ValueMatch
+from argus_sql.linking.schema_graph import build_compound_vocabulary
+from argus_sql.linking.schema_graph import expand_fk_subgraph
+from argus_sql.linking.schema_graph import resolve_effective_foreign_keys
+from argus_sql.linking.schema_graph import tokenize_identifier
 from argus_sql.linking.types import ColumnScore
 from argus_sql.linking.types import SchemaLinkerConfig
-
-# Stopwords excluded when computing lexical overlap with column identifiers.
-_STOPWORDS: frozenset[str] = frozenset({
-    "a",
-    "an",
-    "and",
-    "are",
-    "as",
-    "at",
-    "be",
-    "by",
-    "for",
-    "from",
-    "give",
-    "has",
-    "have",
-    "how",
-    "in",
-    "is",
-    "it",
-    "list",
-    "many",
-    "of",
-    "on",
-    "or",
-    "show",
-    "that",
-    "the",
-    "to",
-    "what",
-    "where",
-    "which",
-    "with",
-})
-
-
-def _tokenize_identifier(text: str) -> set[str]:
-  """Splits snake_case, camelCase, and prose text into normalized root tokens."""
-  # Split camelCase transitions before breaking on non-alphanumeric delimiters.
-  spaced = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", text)
-  raw_tokens = re.findall(r"[a-zA-Z0-9]+", spaced.lower())
-  normalized: set[str] = set()
-  for tok in raw_tokens:
-    if tok in _STOPWORDS or len(tok) < 2:
-      continue
-    normalized.add(tok)
-    # Add light singular stem ('schools' -> 'school') for plural invariance.
-    if len(tok) > 4 and tok.endswith("s") and not tok.endswith("ss"):
-      normalized.add(tok[:-1])
-  return normalized
 
 
 def _overlap_score(query_tokens: set[str], target_tokens: set[str]) -> float:
@@ -74,31 +26,25 @@ def _overlap_score(query_tokens: set[str], target_tokens: set[str]) -> float:
   if not query_tokens or not target_tokens:
     return 0.0
   shared = len(query_tokens & target_tokens)
-  # Cap denominator at 4 so verbose column descriptions are not penalized.
+  # Cap denominator at 4 so rich codebook column descriptions are not penalized.
   return min(1.0, shared / max(1, min(len(target_tokens), 4)))
 
 
-def _shortest_fk_path(
-    start_table: str,
-    goal_table: str,
-    adjacency: dict[str, list[tuple[str, ForeignKeyEdge]]],
-) -> list[tuple[str, ForeignKeyEdge]]:
-  """Finds shortest undirected FK join path between two tables via BFS."""
-  # Unweighted BFS guarantees minimum-hop intermediate bridge table recovery.
-  queue: deque[tuple[str, list[tuple[str, ForeignKeyEdge]]]] = deque(
-      [(start_table, [])]
+def _wide_table_column_priority(col_name: str, data_type: str) -> float:
+  """Provides a tiny structural tie-break on wide (>32 col) tables."""
+  low = col_name.lower()
+  # Prioritize status/type/category/location/date/name columns over sparse codes
+  # so wide tables (e.g., 115-col sports tables) retain descriptive dimensions.
+  priority_keywords = (
+      "type", "status", "name", "city", "county", "state", "country", "date",
+      "year", "grade", "score", "rate", "charter", "email", "phone", "street",
   )
-  visited = {start_table}
-  while queue:
-    current, path = queue.popleft()
-    if current == goal_table:
-      return path
-    # Traverse undirected FK edges so both parent->child and child->parent work.
-    for neighbor, edge in adjacency.get(current, ()):
-      if neighbor not in visited:
-        visited.add(neighbor)
-        queue.append((neighbor, [*path, (neighbor, edge)]))
-  return []
+  if any(kw in low for kw in priority_keywords):
+    return 0.02
+  # Prefer TEXT dimensions slightly over anonymous numeric betting/stat slots.
+  if "TEXT" in data_type.upper():
+    return 0.01
+  return 0.0
 
 
 def link_schema_with_fk_closure(
@@ -128,8 +74,10 @@ def link_schema_with_fk_closure(
       else ()
   )
 
-  q_tokens = _tokenize_identifier(intent.canonical_question)
-  ev_tokens = _tokenize_identifier(evidence)
+  # Build dynamic compound sub-word vocabulary from question and evidence text.
+  vocab = build_compound_vocabulary((intent.canonical_question, evidence))
+  q_tokens = tokenize_identifier(intent.canonical_question, vocab)
+  ev_tokens = tokenize_identifier(evidence, vocab)
 
   # Map `(lower_table, lower_col) -> best ValueMatch similarity`.
   val_score_map: dict[tuple[str, str], float] = {}
@@ -137,29 +85,37 @@ def link_schema_with_fk_closure(
     key = (vm.table_name.lower(), vm.column_name.lower())
     val_score_map[key] = max(val_score_map.get(key, 0.0), vm.similarity_score)
 
+  # Resolve explicit FKs plus inferred entity-PK matches when closure is active.
+  effective_fks = resolve_effective_foreign_keys(
+      schema, enable_implicit=cfg.enable_fk_closure
+  )
+
   # Score every column across all tables using lexical, evidence, and value hits.
   scores_by_table: dict[str, list[ColumnScore]] = {}
   seed_tables: list[str] = []
 
   for table in schema.tables:
     t_lower = table.name.lower()
-    t_tokens = _tokenize_identifier(table.name)
-    table_hit = _overlap_score(q_tokens | ev_tokens, t_tokens)
+    t_tokens = tokenize_identifier(table.name, vocab)
+    combined_q_ev = q_tokens | ev_tokens
+    table_hit = (
+        1.0 if t_lower in combined_q_ev else _overlap_score(combined_q_ev, t_tokens)
+    )
     col_scores: list[ColumnScore] = []
 
     for col in table.columns:
-      c_tokens = _tokenize_identifier(f"{col.name} {col.description}")
+      c_tokens = tokenize_identifier(f"{col.name} {col.description}", vocab)
       raw_lex = _overlap_score(q_tokens, c_tokens)
       # Discount pure surrogate/FK `*_id` columns on unmentioned tables so star
       # schemas do not pull in every child table; true bridges enter via BFS!
-      is_key_col = col.is_primary_key or col.name.lower().endswith("_id")
+      c_low = col.name.lower()
+      is_key_col = col.is_primary_key or c_low.endswith(("_id", "id"))
       if is_key_col and table_hit == 0.0 and not col.description:
         raw_lex *= 0.25
       lex = max(raw_lex, 0.35 * table_hit)
       ev = _overlap_score(ev_tokens, c_tokens)
-      val = val_score_map.get((t_lower, col.name.lower()), 0.0)
-      cs = ColumnScore(table.name, col.name, lex, ev, val)
-      col_scores.append(cs)
+      val = val_score_map.get((t_lower, c_low), 0.0)
+      col_scores.append(ColumnScore(table.name, col.name, lex, ev, val))
 
     scores_by_table[t_lower] = col_scores
     best_col = max((c.total_score for c in col_scores), default=0.0)
@@ -180,10 +136,10 @@ def link_schema_with_fk_closure(
 
   # Prune isolated orphan distractor tables (0 FKs) when an FK-connected seed
   # table already covers the same matched non-key column names.
-  if cfg.enable_fk_closure and len(seed_tables) >= 2 and schema.foreign_keys:
+  if cfg.enable_fk_closure and len(seed_tables) >= 2 and effective_fks:
     fk_participating = {
-        e.source_table.lower() for e in schema.foreign_keys
-    } | {e.target_table.lower() for e in schema.foreign_keys}
+        e.source_table.lower() for e in effective_fks
+    } | {e.target_table.lower() for e in effective_fks}
     connected_cols: set[str] = set()
     for t_low in seed_tables:
       if t_low in fk_participating:
@@ -203,39 +159,21 @@ def link_schema_with_fk_closure(
         }.issubset(connected_cols)
     ]
 
-  # Recover intermediate bridge tables via Steiner-like pairwise BFS FK closure.
-  selected_table_set = set(seed_tables)
-  bridge_tables: list[str] = []
-  fk_columns_needed: dict[str, set[str]] = {t: set() for t in selected_table_set}
-
-  if cfg.enable_fk_closure and len(seed_tables) >= 2 and schema.foreign_keys:
-    # Build an undirected FK adjacency list so joins traverse both directions.
-    adjacency: dict[str, list[tuple[str, ForeignKeyEdge]]] = {}
-    for edge in schema.foreign_keys:
-      src = edge.source_table.lower()
-      dst = edge.target_table.lower()
-      adjacency.setdefault(src, []).append((dst, edge))
-      adjacency.setdefault(dst, []).append((src, edge))
-
-    # Connect every seed table to the anchor table along shortest FK paths.
-    anchor = seed_tables[0]
-    for other in seed_tables[1:]:
-      path = _shortest_fk_path(anchor, other, adjacency)
-      for hop_table, edge in path:
-        if hop_table not in selected_table_set:
-          selected_table_set.add(hop_table)
-          bridge_tables.append(hop_table)
-        # Preserve foreign-key join columns even if lexically unmentioned.
-        fk_columns_needed.setdefault(edge.source_table.lower(), set()).add(
-            edge.source_column.lower()
-        )
-        fk_columns_needed.setdefault(edge.target_table.lower(), set()).add(
-            edge.target_column.lower()
-        )
+  # Recover Steiner bridges, M:N junction tables, and compact lookup dimensions.
+  if cfg.enable_fk_closure and effective_fks:
+    selected_table_set, bridge_tables, fk_columns_needed = expand_fk_subgraph(
+        schema=schema,
+        seed_tables=seed_tables,
+        fk_edges=effective_fks,
+    )
+  else:
+    selected_table_set = set(seed_tables)
+    bridge_tables = []
+    fk_columns_needed = {t: set() for t in selected_table_set}
 
   # Always retain foreign-key endpoints connecting already-selected tables.
   retained_edges: list[ForeignKeyEdge] = []
-  for edge in schema.foreign_keys:
+  for edge in effective_fks:
     src = edge.source_table.lower()
     dst = edge.target_table.lower()
     if src in selected_table_set and dst in selected_table_set:
@@ -243,7 +181,9 @@ def link_schema_with_fk_closure(
       fk_columns_needed.setdefault(src, set()).add(edge.source_column.lower())
       fk_columns_needed.setdefault(dst, set()).add(edge.target_column.lower())
 
-  # Select top-scoring columns + mandatory PK/FK columns per retained table.
+  # Retain 100% of columns on compact/medium tables (`<= full_table_column_ceiling`)
+  # so unmentioned measure or status columns are never dropped; prune ultra-wide
+  # tables (`> 32` cols) to top-scoring + mandatory PK/FK columns.
   selected_cols_map: dict[str, tuple[str, ...]] = {}
   ordered_selected_tables: list[str] = []
   for table in schema.tables:
@@ -252,25 +192,32 @@ def link_schema_with_fk_closure(
       continue
     ordered_selected_tables.append(table.name)
 
-    # Sort table columns by composite lexical + evidence + cell-value score.
+    if len(table.columns) <= cfg.full_table_column_ceiling:
+      selected_cols_map[table.name] = tuple(col.name for col in table.columns)
+      continue
+
+    dtype_by_low = {c.name.lower(): c.data_type for c in table.columns}
     ranked_cols = sorted(
         scores_by_table[t_lower],
-        key=lambda c: c.total_score,
+        key=lambda c: (
+            c.total_score
+            + _wide_table_column_priority(
+                c.column_name, dtype_by_low.get(c.column_name.lower(), "")
+            )
+        ),
         reverse=True,
     )
-    top_names = {
-        cs.column_name.lower()
-        for cs in ranked_cols[: cfg.max_columns_per_table]
-        if cs.total_score >= cfg.min_column_score
+    # Keep all positive hits plus top descriptive columns up to `max_columns_per_table`.
+    positive_hits = {
+        cs.column_name.lower() for cs in ranked_cols if cs.total_score > 0.0
     }
-    # Ensure every table keeps at least its top-2 columns alongside PK/FK keys.
-    if not top_names:
-      top_names = {cs.column_name.lower() for cs in ranked_cols[:2]}
-
+    budget_fill = {
+        cs.column_name.lower() for cs in ranked_cols[: cfg.max_columns_per_table]
+    }
     mandatory_keys = fk_columns_needed.get(t_lower, set()) | {
         col.name.lower() for col in table.columns if col.is_primary_key
     }
-    keep_set = top_names | mandatory_keys
+    keep_set = positive_hits | budget_fill | mandatory_keys
     selected_cols_map[table.name] = tuple(
         col.name for col in table.columns if col.name.lower() in keep_set
     )

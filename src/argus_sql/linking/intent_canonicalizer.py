@@ -109,12 +109,12 @@ def _normalize_spoken_numbers(text: str) -> str:
 
 
 def _extract_entity_candidates(question: str, evidence: str) -> tuple[str, ...]:
-  """Extracts quoted literals, capitalized spans, and spoken expansions."""
+  """Extracts quoted literals, capitalized spans, codes, and spoken expansions."""
   spans: list[str] = []
   combined = f"{question} {evidence}".strip()
 
   # 1. Capture single- or double-quoted literal values verbatim.
-  for match in re.finditer(r"['\"]([^'\"]{2,50})['\"]", combined):
+  for match in re.finditer(r"['\"]([^'\"]{1,50})['\"]", combined):
     val = match.group(1).strip()
     if val and val not in spans:
       spans.append(val)
@@ -135,75 +135,132 @@ def _extract_entity_candidates(question: str, evidence: str) -> tuple[str, ...]:
         "list",
         "find",
         "give",
+        "please",
+        "among",
         "calculate",
         "select",
     }:
       if phrase not in spans:
         spans.append(phrase)
 
-  # 3. Capture lowercase n-grams after 'in', 'of', 'for', 'named', 'called'.
+  # 3. Capture hyphen-prefixed domain codes (e.g., 'czk-paying' -> 'czk').
   for match in re.finditer(
-      r"\b(?:in|for|named|called|county|state|status|type)\s+"
-      r"([a-zA-Z][a-zA-Z0-9_-]{2,25}(?:\s+[a-zA-Z][a-zA-Z0-9_-]{2,25})?)",
+      r"\b([a-zA-Z]{2,6})-(?:paying|based|funded|run|level|type)\b",
+      question,
+      re.IGNORECASE,
+  ):
+    code_tok = match.group(1).strip()
+    if code_tok not in spans:
+      spans.append(code_tok)
+
+  # 4. Capture lowercase/mixed n-grams after relational prepositions and cues.
+  for match in re.finditer(
+      r"\b(?:in|for|named|called|county|state|status|type|currency|segment"
+      r"|country|tagged|code)\s+"
+      r"([a-zA-Z][a-zA-Z0-9_-]{1,25}(?:\s+[a-zA-Z][a-zA-Z0-9_-]{2,25})?)",
       question,
       re.IGNORECASE,
   ):
     candidate = match.group(1).strip()
-    if candidate not in spans:
+    if candidate.lower() not in {"the", "each", "all", "any"} and candidate not in spans:
       spans.append(candidate)
 
-  # 4. Add canonical forms for common spoken abbreviations.
+  # 5. Add canonical forms for common spoken abbreviations.
   lower_q = question.lower()
   for abbrev, expanded in _SPOKEN_EXPANSIONS:
     if re.search(rf"\b{re.escape(abbrev)}(?:\b|$)", lower_q):
       if expanded not in spans:
         spans.append(expanded)
 
-  return tuple(spans[:12])
+  return tuple(spans[:16])
 
 
 def _estimate_projection_arity(canonical_q: str) -> int:
-  """Estimates how many output columns the user's question asks to return."""
+  """Estimates requested output arity (`0` = unconstrained narrative prompt)."""
   lower = canonical_q.lower()
+  # Explicit single-output directives override narrative context.
+  if re.search(
+      r"\b(?:only|just)\s+need\s+the\s+(?:single\s+)?(?:count|total|number|"
+      r"average|percentage|rate|ratio|difference|score|value|name|id)\b",
+      lower,
+  ):
+    return 1
+
+  # Multi-sentence narrative briefings (>38 words or >=2 sentences) frequently
+  # specify custom 4..16 column schemas; leave unconstrained (`0`) to avoid drift.
+  body_no_end = canonical_q.rstrip(".?!")
+  if len(canonical_q.split()) > 38 or body_no_end.count(".") >= 2:
+    return 0
+
   # Expand compound multi-field shorthand common in BIRD-SQL prompts.
   if "full communication address" in lower or "complete address" in lower:
     return 4
   if "full names" in lower:
     return 4
 
-  # Inspect follow-up projection directives ('Indicate X, Y and Z', 'Include X').
+  # Detect multi-pair comparison tails ('between A and B, B and C, and C and A').
+  pair_tail = re.search(
+      r"\bbetween\s+([^?.!]+,\s*[^?.!]+\band\b[^?.!]+)",
+      lower,
+  )
+  if pair_tail:
+    pair_clauses = [
+        seg.strip()
+        for seg in pair_tail.group(1).split(",")
+        if " and " in seg.lower()
+    ]
+    if len(pair_clauses) >= 2:
+      return min(len(pair_clauses), 5)
+
+  # Detect dual superlative pairs ('biggest and lowest', 'highest and lowest').
+  if re.search(
+      r"\b(?:biggest|highest|largest|most|maximum)\s+and\s+"
+      r"(?:lowest|smallest|least|minimum)\b",
+      lower,
+  ):
+    return 2
+
+  # Inspect sentence-anchored projection directives (avoiding relative 'that include').
   followup = re.search(
-      r"\b(?:indicate|include|provide|along\s+with|as\s+well\s+as|showing)\s+"
-      r"([^?.!]+)",
+      r"(?:(?:^|[.;])\s*(?:please\s+)?(?:indicate|include|provide)\s+"
+      r"|\b(?:along\s+with|as\s+well\s+as)\s+)([^?.!;]{3,55})",
       lower,
   )
   if followup:
     extra_parts = [
         p.strip()
         for p in re.split(r",|\band\b|\bas\s+well\s+as\b", followup.group(1))
-        if p.strip()
+        if p.strip() and len(p.split()) <= 6
     ]
-    return max(2, min(1 + len(extra_parts), 5))
+    if extra_parts:
+      return max(2, min(1 + len(extra_parts), 5))
 
   # Explicit single-sentence scalar aggregations ('how many', 'what is the avg').
   if re.match(
-      r"^(?:how\s+many|what\s+is\s+the\s+(?:total|average|ratio|rate|percentage|"
-      r"number|count|highest|lowest|maximum|minimum))\b",
+      r"^(?:how\s+many|what\s+(?:is|was)\s+the\s+(?:total|average|mean|ratio|"
+      r"rate|percentage|number|count|highest|lowest|maximum|minimum|difference))\b",
       lower,
   ):
-    if " and " not in lower[:55] and "." not in canonical_q.rstrip(".?!"):
+    if " and " not in lower[:55] and "." not in body_no_end:
       return 1
 
-  # Look for 'list/give/what are the X and Y of/for' multi-column projections.
+  # Look for compact 'list/give/show/what are the X and Y of/for' projections
+  # (excluding 'state' which frequently appears as the noun 'in the state').
   proj_match = re.search(
-      r"\b(?:list|give|show|state|what\s+are|find)\s+(?:the\s+)?([^,?]+(?:,\s*[^,?]+)*"
-      r"(?:\s+and\s+[^,?]+)?)\s+(?:of|for|in|among|where|with)\b",
+      r"\b(?:list|give|show|what\s+are)\s+(?:the\s+|each\s+)?"
+      r"([^,?.!;]{1,40}(?:,\s*[^,?.!;]{1,30})*(?:\s+and\s+[^,?.!;]{1,30})?)\s+"
+      r"(?:of|for|in|among|where|with|by)\b",
       lower,
   )
   if proj_match:
     clause = proj_match.group(1)
-    parts = [p.strip() for p in re.split(r",|\band\b", clause) if p.strip()]
-    return max(1, min(len(parts), 5))
+    parts = [
+        p.strip()
+        for p in re.split(r",|\band\b", clause)
+        if p.strip() and len(p.split()) <= 6
+    ]
+    if parts:
+      return max(1, min(len(parts), 5))
   return 1
 
 

@@ -151,7 +151,7 @@ def main(argv: Sequence[str] | None = None) -> int:
       "--model",
       type=str,
       default="auto",
-      help="Model identifier (`auto` selects `gemini-2.5-flash` or `gpt-4o-mini`).",
+      help="Model identifier (`auto` selects `gemini-3.7-flash` or `gpt-4o-mini`).",
   )
   parser.add_argument(
       "--endpoint-url",

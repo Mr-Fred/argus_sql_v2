@@ -16,10 +16,10 @@ As conversational and voice-driven interfaces become a primary way humans intera
 
 **Argus-SQL** systematically implements, compares, and recombines modular NL2SQL operators into a fast, voice-ready four-stage architecture:
 
-1. **Voice & Intent Canonicalizer (`linking/intent_canonicalizer.py`)**: Strips ASR disfluencies/stutters, normalizes spoken cardinals (`"top five"` -> `top 5`), expands geographic shorthand, and estimates complexity & projection arity.
-2. **3-Gram Cell Value Index + FK-Discounted Steiner Closure (`linking/value_retriever.py`, `linking/fk_schema_linker.py`)**: Grounds messy string cells in sub-millisecond time while recovering multi-hop foreign-key bridge tables without star-schema explosion.
-3. **Complexity-Gated Diverse Batch Synthesis (`pipelines/argus_pipeline.py`)**: Routes simple lookups through a $K=1$ Voice Fast-Path and dispatches $K=3$ diverse strategies concurrently (`decomposed_cot`, `formula_defensive`, `skeleton_minimal`) for analytical queries.
-4. **Semantic Invariant Verifier, Zero-Token Algebraic Repair & Consensus (`verification/`)**: Audits live outcomes in a C-authorizer-locked read-only SQLite sandbox (`sandbox/sqlite_sandbox.py`), deterministically repairs SQLite division/NULL traps in `< 1 ms`, and ranks equivalence clusters via Invariant-Weighted Consensus.
+1. **Voice & Intent Canonicalizer (`linking/intent_canonicalizer.py`)**: Strips ASR disfluencies/stutters, normalizes spoken cardinals (`"top five"` -> `top 5`), extracts hyphenated/short lowercase domain codes, and estimates complexity & multi-pair/dual-extrema projection arity.
+2. **Exact Short-Code + 3-Gram Cell Value Index & Implicit/Junction FK Closure (`linking/value_retriever.py`, `linking/schema_graph.py`, `linking/fk_schema_linker.py`)**: Grounds messy string cells and 2–3 character domain codes in sub-millisecond time, hydrates SQLite sample literals and CSV value codebooks, splits compound identifiers (`gasstations` -> `gas`, `station`), and recovers explicit, implicit PK-matched, and M:N junction bridge tables (`98%+` gold column/table recall across `bird_mini_dev`).
+3. **Complexity-Gated Diverse Batch Synthesis (`pipelines/argus_pipeline.py`)**: Renders valid composite `PRIMARY KEY (...)` grain DDL, routes simple lookups through a $K=1$ Voice Fast-Path, and dispatches $K=3$ diverse strategies concurrently (`decomposed_cot`, `formula_defensive`, `skeleton_minimal`) for analytical queries.
+4. **7-Invariant Semantic Verifier, Zero-Token Algebraic Repair & Consensus (`verification/`)**: Audits live outcomes in a C-authorizer-locked read-only SQLite sandbox (`sandbox/sqlite_sandbox.py`), deterministically repairs SQLite integer/parenthesized division, `NULL`-first sorts, and 1-to-many `JOIN` fanout duplicates (`SELECT DISTINCT`) in `< 1 ms`, and ranks equivalence clusters via Invariant-Weighted Consensus.
 
 ---
 
@@ -50,11 +50,11 @@ PYTHONPATH=src python3 -m argus_sql.evaluation.cli --mode diagnostic
 
 | System | Simple EX | Mod. EX | Chall. EX | Clean EX (%) | Clean R-VES | Voice EX (%) | Mean Tokens |
 | :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
-| `B0_ZeroShotDDL` | 75.0 | 37.5 | 0.0 | 37.5 | 37.5 | 16.7 | 294 |
-| `B1_DINDecomposed` | 100.0 | 25.0 | 0.0 | 41.7 | 41.7 | 25.0 | 218 |
-| `B2_MACRefiner` | 100.0 | 37.5 | 0.0 | 45.8 | 45.8 | 25.0 | 215 |
-| `B3_CHESSValueConsistency` | 100.0 | 62.5 | 0.0 | 54.2 | 54.2 | 41.7 | 726 |
-| **`Argus-SQL` (Ours)** | **100.0** | **100.0** | **100.0** | **100.0** | **100.0** | **100.0** | **662** |
+| `B0_ZeroShotDDL` | 75.0 | 37.5 | 0.0 | 37.5 | 37.5 | 16.7 | 338 |
+| `B1_DINDecomposed` | 100.0 | 25.0 | 0.0 | 41.7 | 41.7 | 25.0 | 316 |
+| `B2_MACRefiner` | 100.0 | 37.5 | 0.0 | 45.8 | 45.8 | 25.0 | 318 |
+| `B3_CHESSValueConsistency` | 100.0 | 62.5 | 0.0 | 54.2 | 54.2 | 41.7 | 1018 |
+| **`Argus-SQL` (Ours)** | **100.0** | **100.0** | **100.0** | **100.0** | **100.0** | **100.0** | **921** |
 
 > Paired two-sided exact McNemar test (`Argus-SQL` vs. `B3_CHESSValueConsistency`, $N = 48$ Clean + Voice queries): $p = 5.96 \times 10^{-8}$.
 
@@ -86,7 +86,8 @@ PYTHONPATH=src python3 -m argus_sql.evaluation.cli --mode diagnostic
 - **Windows Personal Computer (Antigravity IDE / PowerShell)**:
   ```powershell
   # Open the cloned repo in Antigravity IDE on Windows (reads AGENTS.md automatically).
-  # Configure gitignored `.env` ONLY on your personal Windows PC:
+  # Configure gitignored `.env` ONLY on your personal Windows PC
+  # (defaults to GOOGLE_CLOUD_LOCATION=global and ARGUS_LLM_MODEL=gemini-3.7-flash):
   Copy-Item config\personal_env.example .env
   # Edit `.env` (set GOOGLE_CLOUD_PROJECT + run `gcloud auth application-default login`,
   # OR set ARGUS_LLM_API_KEY in `.env`), then run a 20-query smoke slice or full split:
@@ -95,9 +96,11 @@ PYTHONPATH=src python3 -m argus_sql.evaluation.cli --mode diagnostic
   .\scripts\run_personal_eval.ps1
   ```
 
-- **macOS / Linux Personal Computer (Bash)**:
+- **macOS / Linux / Remote Linux VM (Bash)**:
   ```bash
+  # Defaults to GOOGLE_CLOUD_LOCATION=global and ARGUS_LLM_MODEL=gemini-3.7-flash:
   cp config/personal_env.example .env
+  # On a headless Linux VM, authenticate via `gcloud auth application-default login --no-launch-browser`
   ARGUS_LIMIT=20 ./scripts/run_personal_eval.sh --only-argus
   # Or run full B0..B3 + Argus-SQL evaluation:
   ./scripts/run_personal_eval.sh

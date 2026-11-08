@@ -59,17 +59,21 @@ class SchemaLinkerConfig:
   """Configuration controlling pruning aggressiveness and ablation toggles.
 
   Attributes:
-    max_columns_per_table: Upper bound on non-key columns kept per table.
-    min_column_score: Minimum relevance score to retain a non-key column.
-    enable_fk_closure: Whether to recover bridge tables via FK shortest paths.
+    max_columns_per_table: Upper bound on non-key columns kept on wide tables.
+    full_table_column_ceiling: Keep all columns when a selected table has at
+      most this many columns so measure/type columns are never dropped.
+    min_column_score: Minimum relevance score to seed a table from column hits.
+    enable_fk_closure: Whether to recover bridge tables via FK graph closure.
     enable_value_grounding: Whether to inject n-gram grounded cell literals.
     top_k_values: Maximum grounded `ValueMatch` items retained per query.
   """
 
-  # Keep up to 8 non-key columns per table to avoid DDL context bloat.
-  max_columns_per_table: int = 8
-  # Threshold suppresses random 1-character substring collisions.
+  # Prune ultra-wide tables (>32 cols, e.g., 115-col sports/card tables) cleanly.
+  max_columns_per_table: int = 32
+  # Narrow and medium tables keep 100% of columns once the table is selected.
+  full_table_column_ceiling: int = 32
+  # Threshold suppresses random 1-character substring collisions during seeding.
   min_column_score: float = 0.18
   enable_fk_closure: bool = True
   enable_value_grounding: bool = True
-  top_k_values: int = 6
+  top_k_values: int = 8

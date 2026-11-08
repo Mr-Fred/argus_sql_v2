@@ -139,7 +139,7 @@ def build_live_llm_client(
   raw_model = model_name.strip()
   if not raw_model or raw_model.lower() == "auto":
     env_model = cfg.get("ARGUS_LLM_MODEL", "").strip()
-    default_slug = "gemini-2.5-flash" if norm_provider == "vertex" else "gpt-4o-mini"
+    default_slug = "gemini-3.7-flash" if norm_provider == "vertex" else "gpt-4o-mini"
     resolved_model = env_model or default_slug
   else:
     resolved_model = raw_model

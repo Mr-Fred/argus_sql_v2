@@ -12,24 +12,40 @@ from argus_sql.contracts.types import InvariantIssue
 from argus_sql.contracts.types import LinkedSchemaContext
 from argus_sql.contracts.types import SQLCandidate
 
-# Atomic SQL operand: aggregate call or (possibly table-qualified) quoted/bare
-# column identifier (including BIRD backtick names like `` T1.`Free Meal (K-12)` ``).
+# Atomic SQL token inside function arguments or parenthesized arithmetic groups.
+_INNER_ATOM = (
+    r"(?:[^()'\"`\[]|'(?:''|[^'])*'|\"(?:\"\"|[^\"])*\""
+    r"|`(?:``|[^`])*`|\[[^\]]*\])"
+)
+_NESTED_PARENS = rf"\((?:{_INNER_ATOM}|\((?:{_INNER_ATOM}|\({_INNER_ATOM}*\))*\))*\)"
+
+# SQL clause keywords that may precede `(` without forming a function call.
+_NON_FN_KW = (
+    r"(?:SELECT|DISTINCT|FROM|WHERE|JOIN|ON|AND|OR|NOT|IN|AS|BY"
+    r"|WHEN|THEN|ELSE|CASE|OVER|WITH|UNION|INTERSECT|EXCEPT|HAVING|LIMIT|EXISTS)"
+)
+
+# Atomic SQL operand: any SQL function/CAST call `fn(...)`, standalone balanced
+# parenthesized expression `(a - b)` not preceded by an identifier, or a
+# (possibly table-qualified) quoted/bare column identifier not followed by `(`.
 _SQL_OPERAND_PAT = (
-    r"(?:(?:SUM|COUNT|AVG|TOTAL|MAX|MIN)\s*\((?:[^()]|\([^()]*\))+\)"
+    rf"(?:(?!\b{_NON_FN_KW}\b)\b[a-zA-Z_][a-zA-Z0-9_]*\s*{_NESTED_PARENS}"
+    rf"|(?<![a-zA-Z0-9_]){_NESTED_PARENS}"
     r"|(?:[a-zA-Z_][a-zA-Z0-9_]*\.)?"
-    r"(?:`(?:``|[^`])+`|\"(?:\"\"|[^\"])+\"|\[[^\]]+\]|[a-zA-Z_][a-zA-Z0-9_]*))"
+    r"(?:`(?:``|[^`])+`|\"(?:\"\"|[^\"])+\"|\[[^\]]+\]"
+    rf"|\b(?!{_NON_FN_KW}\b)[a-zA-Z_][a-zA-Z0-9_]*(?!\s*\()))"
 )
 
 # Ordered token matcher:
 # 1. Single-quoted string literals (`'Free/Reduced'`) -> keep untouched.
-# 2. Already-cast numerators (`CAST(... AS REAL) [/ or * 100 /]`) -> keep untouched.
+# 2. Already-REAL-cast numerators (`CAST(... AS REAL|FLOAT|DOUBLE) /`) -> keep.
 # 3. Uncast `lhs [* 100] / rhs` divisions -> promote to `CAST(...) / NULLIF(...)`.
 # 4. Standalone quoted identifiers (`T1.`Charter School (Y/N)``) -> advance past
 #    the closing quote so internal `(Y/N)` slashes are never split!
 _QUOTED_OR_DIV_RE = re.compile(
     r"'(?:''|[^'])*'|"
-    r"(\bCAST\s*\((?:[^()]|\([^()]*\))+\s+AS\s+(?:REAL|FLOAT|DOUBLE)\s*\)"
-    r"(?:\s*\*\s*100(?:\.0)?)?\s*/)|"
+    rf"(\bCAST\s*\((?:{_INNER_ATOM}|{_NESTED_PARENS})+\s+AS\s+"
+    r"(?:REAL|FLOAT|DOUBLE)\s*\)(?:\s*\*\s*100(?:\.0)?)?\s*/)|"
     rf"({_SQL_OPERAND_PAT}(?:\s*\*\s*100(?:\.0)?)?)\s*/\s*({_SQL_OPERAND_PAT})|"
     r"`(?:``|[^`])*`|\"(?:\"\"|[^\"])*\"|\[[^\]]*\]",
     re.IGNORECASE,
@@ -52,8 +68,10 @@ def _rewrite_uncast_divisions(sql_text: str) -> str:
     # Only Branch 3 populates groups (2, 3); all other branches stay unchanged.
     if match.group(2) is None or match.group(3) is None:
       return token
-    lhs, rhs = match.group(2), match.group(3)
-    return f"CAST({lhs} AS REAL) / NULLIF({rhs}, 0)"
+    lhs, rhs = match.group(2).strip(), match.group(3).strip()
+    # Avoid redundant `NULLIF(NULLIF(x, 0), 0)` when denominator is guarded.
+    safe_rhs = rhs if re.match(r"^NULLIF\s*\(", rhs, re.IGNORECASE) else f"NULLIF({rhs}, 0)"
+    return f"CAST({lhs} AS REAL) / {safe_rhs}"
 
   return _QUOTED_OR_DIV_RE.sub(_replacer, sql_text)
 
@@ -84,9 +102,25 @@ def _mask_subqueries_and_literals(sql_prefix: str) -> str:
 
 def _inject_top_level_not_null(prefix: str, order_col: str) -> str | None:
   """Injects `<order_col> IS NOT NULL` safely at top-level query scope."""
+  # Abort if `ORDER BY` lies inside an unclosed subquery or CTE parenthesis.
+  no_quotes = re.sub(
+      r"'(?:''|[^'])*'|\"(?:\"\"|[^\"])*\"|`(?:``|[^`])*`|\[[^\]]*\]",
+      " ",
+      prefix,
+  )
+  if no_quotes.count("(") != no_quotes.count(")"):
+    return None
+
   outer_mask = _mask_subqueries_and_literals(prefix)
-  # Skip rewrite if outer query aggregates via GROUP BY before ORDER BY.
-  if re.search(r"\bGROUP\s+BY\b", outer_mask, re.IGNORECASE) is not None:
+  # Skip rewrite if outer query aggregates via GROUP BY or compound UNION/EXCEPT.
+  if (
+      re.search(
+          r"\b(?:GROUP\s+BY|UNION|INTERSECT|EXCEPT)\b",
+          outer_mask,
+          re.IGNORECASE,
+      )
+      is not None
+  ):
     return None
 
   where_match = re.search(r"\bWHERE\b", outer_mask, re.IGNORECASE)
@@ -152,6 +186,14 @@ def apply_algebraic_sql_repairs(
               repaired,
               flags=re.IGNORECASE,
           )
+
+  # 4. Deduplicate 1-to-many entity-listing join fanout via `SELECT DISTINCT`.
+  if "JOIN_FANOUT_DUPLICATES" in issue_codes and re.match(
+      r"^SELECT\s+(?!DISTINCT\b)", repaired, re.IGNORECASE
+  ):
+    repaired = re.sub(
+        r"^SELECT\s+", "SELECT DISTINCT ", repaired, count=1, flags=re.IGNORECASE
+    )
 
   # Return None when rewrites produced no diff to avoid duplicate sandbox runs.
   if repaired == candidate.sql.strip().rstrip(";"):

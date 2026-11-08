@@ -9,6 +9,7 @@ from collections.abc import Sequence
 import difflib
 import logging
 import pathlib
+import re
 import sqlite3
 
 from argus_sql.contracts.types import DatabaseSchema
@@ -36,6 +37,21 @@ def _normalize_cell_text(value: str) -> str:
   return " ".join(value.lower().strip().split())
 
 
+# Common English words skipped when probing bare tokens against cell literals.
+# Filtering stopwords prevents pointless postings lookups on function words.
+_TOKEN_PROBE_STOPWORDS: frozenset[str] = frozenset({
+    "all", "among", "and", "any", "are", "average", "between", "both", "but",
+    "can", "count", "did", "does", "each", "for", "from", "give", "had", "has",
+    "have", "her", "highest", "his", "how", "into", "its", "least", "list",
+    "lowest", "many", "more", "most", "much", "not", "number", "only", "other",
+    "our", "out", "over", "paid", "per", "please", "percentage", "ratio",
+    "rate", "show", "some", "such", "than", "that", "the", "their", "them",
+    "then", "there", "these", "they", "this", "those", "top", "total", "under",
+    "was", "were", "what", "when", "where", "which", "who", "whom", "with",
+    "year", "years",
+})
+
+
 class CellValueRetriever:
   """Inverted character 3-gram retriever grounding query entities to DB cells.
 
@@ -51,8 +67,10 @@ class CellValueRetriever:
     """
     self.entries: tuple[ValueIndexEntry, ...] = tuple(entries)
     self._postings: dict[str, list[int]] = {}
-    # Populate inverted index mapping `3-gram -> entry indices` in O(N).
+    self._exact_index: dict[str, list[int]] = {}
+    # Populate both 3-gram postings and exact-value lookup in O(N).
     for idx, entry in enumerate(self.entries):
+      self._exact_index.setdefault(entry.normalized_value, []).append(idx)
       for gram in entry.trigrams:
         self._postings.setdefault(gram, []).append(idx)
 
@@ -104,11 +122,14 @@ class CellValueRetriever:
       try:
         conn = sqlite3.connect(uri, uri=True, timeout=2.0)
         try:
-          # Scan only declared TEXT/CHAR columns to skip numeric/BLOB keys.
+          # Scan declared TEXT/CHAR columns to skip numeric/BLOB primary keys.
           for table in schema.tables:
             t_ident = table.name.replace('"', '""')
             for col in table.columns:
-              if "TEXT" not in col.data_type.upper() and "CHAR" not in col.data_type.upper():
+              if (
+                  "TEXT" not in col.data_type.upper()
+                  and "CHAR" not in col.data_type.upper()
+              ):
                 continue
               c_ident = col.name.replace('"', '""')
               # Parameterize `max_distinct_per_column` to bound index RAM usage.
@@ -116,13 +137,17 @@ class CellValueRetriever:
                   f'SELECT DISTINCT "{c_ident}" FROM "{t_ident}" '
                   f'WHERE "{c_ident}" IS NOT NULL LIMIT ?'
               )
-              for (cell_val,) in conn.execute(query, (max_distinct_per_column,)):
-                if not isinstance(cell_val, str):
-                  continue
+              raw_cells = [
+                  row[0]
+                  for row in conn.execute(query, (max_distinct_per_column,))
+                  if isinstance(row[0], str)
+              ]
+              # Allow 1-char enum codes ('S', 'D', 'M', 'F') on low-cardinality cols.
+              min_len = 1 if len(raw_cells) <= 16 else 2
+              for cell_val in raw_cells:
                 norm = _normalize_cell_text(cell_val)
                 key = (table.name, col.name, norm)
-                # Ignore single-char flags and huge free-text prose paragraphs.
-                if 1 < len(norm) <= 80 and key not in seen:
+                if min_len <= len(norm) <= 80 and key not in seen:
                   seen.add(key)
                   entries.append(
                       ValueIndexEntry(
@@ -150,7 +175,7 @@ class CellValueRetriever:
   def retrieve(
       self,
       intent: IntentFrame,
-      top_k: int = 6,
+      top_k: int = 8,
       min_similarity: float = 0.45,
   ) -> tuple[ValueMatch, ...]:
     """Retrieves top grounded database literals matching `intent` spans.
@@ -166,27 +191,16 @@ class CellValueRetriever:
     if not self.entries:
       return ()
 
-    # Probe both extracted entity spans and distinctive tokens from the question.
+    # Probe extracted entity spans and distinctive tokens (including 2-3 char
+    # ISO/segment codes like 'sme', 'eur', 'czk', 'ny' on Voice transcripts).
     query_spans: list[str] = list(intent.entities)
-    for token in intent.canonical_question.split():
-      cleaned = token.strip(".,?!'\"()").strip()
-      if len(cleaned) >= 4 and cleaned.lower() not in {
-          "what",
-          "which",
-          "where",
-          "many",
-          "list",
-          "from",
-          "with",
-          "that",
-          "have",
-          "more",
-          "than",
-          "average",
-          "total",
-          "highest",
-          "lowest",
-      }:
+    for raw_tok in re.split(r"[\s,;/()—–-]+", intent.canonical_question):
+      cleaned = raw_tok.strip(".,?!'\"()").strip()
+      if (
+          len(cleaned) >= 2
+          and not cleaned.isdigit()
+          and cleaned.lower() not in _TOKEN_PROBE_STOPWORDS
+      ):
         if cleaned not in query_spans:
           query_spans.append(cleaned)
 
@@ -194,10 +208,28 @@ class CellValueRetriever:
     best_by_cell: dict[tuple[str, str, str], ValueMatch] = {}
     for span in query_spans:
       norm_span = _normalize_cell_text(span)
-      if len(norm_span) < 2:
+      if not norm_span:
         continue
-      span_grams = _compute_trigrams(norm_span)
 
+      # Short 1-3 char codes ('eur', 'sme', 'r') require exact cell match so
+      # short tokens never trigger noisy fuzzy substring collisions!
+      if len(norm_span) <= 3:
+        for entry_idx in self._exact_index.get(norm_span, ()):
+          entry = self.entries[entry_idx]
+          # Only ground 1-char codes when explicitly quoted in `intent.entities`.
+          if len(norm_span) == 1 and span not in intent.entities:
+            continue
+          cell_key = (entry.table_name, entry.column_name, entry.raw_value)
+          best_by_cell[cell_key] = ValueMatch(
+              table_name=entry.table_name,
+              column_name=entry.column_name,
+              matched_value=entry.raw_value,
+              query_span=span,
+              similarity_score=1.0,
+          )
+        continue
+
+      span_grams = _compute_trigrams(norm_span)
       # Accumulate posting-list overlap counts across matching 3-grams.
       hit_counts: dict[int, int] = {}
       for gram in span_grams:
@@ -215,7 +247,9 @@ class CellValueRetriever:
             entry.normalized_value.startswith(norm_span) and len(norm_span) >= 4
         )
         if is_exact_or_prefix or jaccard >= 0.08:
-          shortlist.append((1.0 if is_exact_or_prefix else jaccard, jaccard, entry_idx))
+          shortlist.append(
+              (1.0 if is_exact_or_prefix else jaccard, jaccard, entry_idx)
+          )
       shortlist.sort(reverse=True)
 
       # Stage 2: Blend 3-gram Jaccard recall with SequenceMatcher edit ratio.

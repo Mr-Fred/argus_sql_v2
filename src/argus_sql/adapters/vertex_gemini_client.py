@@ -66,18 +66,15 @@ def extract_gemini_completion_triple(
   if not isinstance(parts, list):
     raise LLMAdapterTransportError("Malformed Vertex candidate parts list.")
 
-  # Separate final SQL parts from internal Gemini 2.5/3.x `thought=True` parts.
+  # Separate final SQL parts from internal Gemini 3.x `thought=True` parts.
   visible_chunks: list[str] = []
-  fallback_chunks: list[str] = []
   for part in parts:
     if isinstance(part, dict) and isinstance(part.get("text"), str):
-      text_piece = part["text"]
-      fallback_chunks.append(text_piece)
       if not bool(part.get("thought", False)):
-        visible_chunks.append(text_piece)
+        visible_chunks.append(part["text"])
 
-  # Prefer non-thought text parts; fall back only if model emitted one raw part.
-  raw_out = "\n".join(visible_chunks or fallback_chunks).strip()
+  # Never leak `thought=True` scratchpads into SQL extraction if output truncated.
+  raw_out = "\n".join(visible_chunks).strip()
   usage = body.get("usageMetadata", {})
   if isinstance(usage, dict):
     p_tok = int(usage.get("promptTokenCount", prompt_char_len // 4))
@@ -97,7 +94,7 @@ class VertexGeminiBatchClient:
   Attributes:
     project_id: Validated Google Cloud project ID used for Vertex AI billing.
     location: Validated Vertex AI location (`'global'` or regional).
-    model_name: Normalized Gemini model identifier (e.g., `'gemini-2.5-flash'`).
+    model_name: Normalized Gemini model identifier (e.g., `'gemini-3.7-flash'`).
     endpoint_url: Constructed HTTPS `generateContent` URL.
     max_concurrency: Bounded worker pool size for parallel batch execution.
   """
@@ -105,11 +102,11 @@ class VertexGeminiBatchClient:
   def __init__(
       self,
       project_id: str,
-      model_name: str = "gemini-2.5-flash",
+      model_name: str = "gemini-3.7-flash",
       location: str = "global",
       max_concurrency: int = 8,
-      timeout_sec: float = 60.0,
-      min_output_tokens: int = 2048,
+      timeout_sec: float = 120.0,
+      min_output_tokens: int = 8192,
       max_retries: int = 3,
       adc_file: pathlib.Path | None = None,
       token_supplier: Callable[[], tuple[str, float]] | None = None,

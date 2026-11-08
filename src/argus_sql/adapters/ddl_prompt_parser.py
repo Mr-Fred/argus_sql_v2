@@ -69,6 +69,9 @@ def parse_prompt_ddl(prompt: str) -> dict[str, ParsedPromptTable]:
       if fk_m:
         fks.append((fk_m.group(1), fk_m.group(2), fk_m.group(3)))
         continue
+      # Skip table-level composite `PRIMARY KEY (...)` constraints cleanly.
+      if line.upper().startswith("PRIMARY KEY"):
+        continue
 
       # Parse column name, SQLite type, and optional `matched_values` literals.
       code_part, _, comment_part = line.partition("--")

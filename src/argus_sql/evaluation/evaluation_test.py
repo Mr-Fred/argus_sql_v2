@@ -127,12 +127,13 @@ class EvaluationModuleTest(unittest.TestCase):
           "SQL": "SELECT COUNT(*) FROM orders",
           "difficulty": "simple",
       }]
-      # Write a UTF-8 BOM (`\xef\xbb\xbf`) CSV matching official BIRD files.
+      # Write a UTF-8 BOM (`\xef\xbb\xbf`) CSV with both column_description and
+      # multiline codebook `value_description` matching official BIRD CSV files.
       desc_dir = bird_root / "dev_databases" / "demo" / "database_description"
       desc_dir.mkdir(parents=True)
       bom_csv = (
-          b"\xef\xbb\xbforiginal_column_name,column_description\n"
-          b"uid,Unique user identifier\n"
+          b"\xef\xbb\xbforiginal_column_name,column_description,value_description\n"
+          b"uid,Unique user identifier,Active = currently enrolled\n"
       )
       (desc_dir / "users.csv").write_bytes(bom_csv)
       (bird_root / "dev_tables.json").write_text(
@@ -141,18 +142,64 @@ class EvaluationModuleTest(unittest.TestCase):
       (bird_root / "dev.json").write_text(
           json.dumps(dev_payload), encoding="utf-8"
       )
-      # Verify tasks, FK edges, and BOM-prefixed column descriptions deserialize.
+      # Verify tasks, FK edges, and merged codebook descriptions deserialize.
       tasks, schemas, sqlite_paths = load_bird_split(bird_root)
       self.assertEqual(len(tasks), 1)
       self.assertEqual(len(schemas["demo"].foreign_keys), 1)
       self.assertEqual(
           schemas["demo"].tables[0].columns[0].description,
-          "Unique user identifier",
+          "Unique user identifier | Active = currently enrolled",
       )
       # Running a non-empty task list with 0 materialized SQLite DBs fails fast.
       sandbox = SQLiteReadOnlySandbox(SandboxPolicy(allowed_db_root=bird_root))
       with self.assertRaises(EvaluationError):
         run_benchmark_suite("EmptyDBs", tasks, (), schemas, sqlite_paths, sandbox)
+
+      # Populate a real SQLite DB and verify `value_examples` + set/float EX!
+      import sqlite3
+      from argus_sql.contracts.types import NLQueryTask, PipelinePrediction
+      from argus_sql.evaluation.bird_metrics import evaluate_prediction
+
+      demo_sqlite = bird_root / "dev_databases" / "demo" / "demo.sqlite"
+      conn = sqlite3.connect(demo_sqlite)
+      try:
+        conn.execute("CREATE TABLE users (uid INTEGER PRIMARY KEY)")
+        conn.execute("CREATE TABLE orders (oid INTEGER PRIMARY KEY, uid INTEGER)")
+        conn.executemany("INSERT INTO users VALUES (?)", [(101,), (102,)])
+        conn.executemany(
+            "INSERT INTO orders VALUES (?, ?)", [(1, 101), (2, 101), (3, 102)]
+        )
+        conn.commit()
+      finally:
+        conn.close()
+
+      _, hydrated_schemas, _ = load_bird_split(bird_root)
+      self.assertEqual(
+          hydrated_schemas["demo"].tables[0].columns[0].value_examples,
+          ("101", "102"),
+      )
+
+      # Verify BIRD set-equivalence (`SELECT uid` == `SELECT DISTINCT uid`) and
+      # IEEE-754 hundred-million sum join-order tolerance (`402524570.7200004`).
+      set_task = NLQueryTask(
+          "s1", "demo", "List user ids", gold_sql="SELECT DISTINCT uid FROM orders"
+      )
+      set_pred = PipelinePrediction(
+          "s1", "demo", "Argus-SQL", "SELECT uid FROM orders", 1.0, 50
+      )
+      self.assertTrue(
+          evaluate_prediction(set_task, set_pred, demo_sqlite, sandbox).ex_correct
+      )
+
+      float_task = NLQueryTask(
+          "f1", "demo", "Sum", gold_sql="SELECT 402524570.7200004"
+      )
+      float_pred = PipelinePrediction(
+          "f1", "demo", "Argus-SQL", "SELECT 402524570.7199997", 1.0, 50
+      )
+      self.assertTrue(
+          evaluate_prediction(float_task, float_pred, demo_sqlite, sandbox).ex_correct
+      )
 
   def test_bird_loader_auto_resolves_mini_dev_json_and_jsonl(self) -> None:
     """`load_bird_split` auto-discovers `mini_dev_sqlite.jsonl` and lowercase sql."""

@@ -10,6 +10,7 @@ import pathlib
 
 from argus_sql.adapters.types import BatchLLMPort
 from argus_sql.contracts.types import DatabaseSchema
+from argus_sql.contracts.types import ExecutionOutcome
 from argus_sql.contracts.types import NLQueryTask
 from argus_sql.evaluation.bird_metrics import evaluate_prediction
 from argus_sql.evaluation.bird_metrics import summarize_system_records
@@ -156,7 +157,7 @@ def run_benchmark_suite(
         f"SQLite databases ({sorted(sqlite_paths)})."
     )
 
-  # Pre-index distinct cell literals once per active database (batch optimization!).
+  # Pre-index distinct cell literals and batch-execute gold SQLs once per DB!
   active_db_ids = {t.db_id for t in active_tasks}
   retrievers: dict[str, CellValueRetriever] = {
       db_id: CellValueRetriever.from_schema_and_sqlite(
@@ -164,6 +165,17 @@ def run_benchmark_suite(
       )
       for db_id in active_db_ids
   }
+  # Batch-execute reference `gold_sql` queries once per database via `execute_batch`
+  # so evaluating 5-6 comparative/ablation pipelines never repeats identical scans.
+  gold_by_qid: dict[str, ExecutionOutcome] = {}
+  for db_id in active_db_ids:
+    db_tasks = [t for t in active_tasks if t.db_id == db_id]
+    db_outs = sandbox.execute_batch(
+        sqlite_paths[db_id], [t.gold_sql for t in db_tasks]
+    )
+    # Map each `question_id` to its shared read-only ExecutionOutcome.
+    for t_item, g_out in zip(db_tasks, db_outs, strict=True):
+      gold_by_qid[t_item.question_id] = g_out
 
   # Collect per-system summary rows and full task-level records for export.
   summaries: list[SystemEvalSummary] = []
@@ -185,7 +197,9 @@ def run_benchmark_suite(
           db_path=db_file,
           value_retriever=retrievers[task.db_id],
       )
-      return evaluate_prediction(task, pred, db_file, sandbox)
+      return evaluate_prediction(
+          task, pred, db_file, sandbox, gold_outcome=gold_by_qid[task.question_id]
+      )
 
     # Dispatch tasks concurrently on live network runs while preserving 1-to-1 order.
     if eff_workers > 1 and len(active_tasks) > 1:

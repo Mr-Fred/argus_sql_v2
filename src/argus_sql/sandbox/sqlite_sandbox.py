@@ -105,12 +105,14 @@ def _canonicalize_cell(val: Any) -> str:
   """Formats a result cell canonically so float precision noise cannot skew EX."""
   if val is None:
     return "<NULL>"
-  if isinstance(val, float):
-    # Round floats to 6 decimal places matching BIRD-SQL evaluation tolerance.
-    return f"{round(val, 6):.6f}"
-  if isinstance(val, int) and not isinstance(val, bool):
-    # Promote integer scalars to `.6f` so `1` and `1.0` hash identically.
-    return f"{float(val):.6f}"
+  if isinstance(val, (int, float)) and not isinstance(val, bool):
+    fval = float(val)
+    # Large sums (>1e5) have ~10^9 ULP spacing in IEEE-754 float64; rounding to
+    # 4 decimals above 1e5 (and 6 decimals below 1e5) prevents join-order sum
+    # non-associativity from splitting equivalent consensus clusters.
+    if abs(fval) >= 100_000.0:
+      return f"{round(fval, 4):.4f}"
+    return f"{round(fval, 6):.6f}"
   return str(val).strip()
 
 
@@ -127,12 +129,13 @@ def compute_result_signature(
   Returns:
     Hexadecimal SHA-256 signature grouping execution-equivalent candidates.
   """
-  # Format each row deterministically before sorting multiset results.
+  # Format each row deterministically; deduplicate unordered row sets matching
+  # official BIRD-SQL `set(predicted_res) == set(ground_truth_res)` semantics.
   formatted_rows = [
       "|".join(_canonicalize_cell(cell) for cell in row) for row in rows
   ]
   if not preserve_row_order:
-    formatted_rows.sort()
+    formatted_rows = sorted(set(formatted_rows))
   joined = "\n".join(formatted_rows)
   return hashlib.sha256(joined.encode("utf-8")).hexdigest()[:24]
 
@@ -211,10 +214,12 @@ class SQLiteReadOnlySandbox:
       return sqlite3.SQLITE_OK
 
     # Progress callback aborts runaway cross-joins once step or time cap hits.
+    progress_stride = min(500_000, max(1_000, max_steps // 2))
+
     def _progress_guard() -> int:
       """Returns non-zero to interrupt SQLite when VM step or time cap expires."""
       nonlocal step_counter
-      step_counter += 100_000
+      step_counter += progress_stride
       # Interrupt query execution if bytecode steps or wall-clock budget is hit.
       if step_counter > max_steps or time.perf_counter_ns() > deadline_ns:
         return 1
@@ -226,7 +231,7 @@ class SQLiteReadOnlySandbox:
       conn = sqlite3.connect(uri, uri=True, timeout=1.5)
       try:
         conn.set_authorizer(_authorizer)
-        conn.set_progress_handler(_progress_guard, 100_000)
+        conn.set_progress_handler(_progress_guard, progress_stride)
         cursor = conn.execute(exec_sql)
         col_names = tuple(desc[0] for desc in (cursor.description or ()))
         fetched = cursor.fetchmany(self.policy.max_returned_rows)

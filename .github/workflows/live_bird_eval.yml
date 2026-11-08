@@ -5,17 +5,18 @@ on:
   workflow_dispatch:
     inputs:
       provider:
-        description: "LLM transport provider (openai or vertex)"
+        description: "LLM transport provider (auto, vertex, or openai)"
         required: true
-        default: "openai"
+        default: "auto"
         type: choice
         options:
-          - openai
+          - auto
           - vertex
+          - openai
       model:
-        description: "Model identifier (e.g., gemini-2.5-flash or gpt-4o)"
+        description: "Model identifier (auto selects gemini-3.7-flash on global Vertex AI or gpt-4o-mini on OpenAI)"
         required: true
-        default: "gpt-4o-mini"
+        default: "auto"
         type: string
       limit:
         description: "Task cap (0 evaluates full split; 20 runs fast smoke test)"

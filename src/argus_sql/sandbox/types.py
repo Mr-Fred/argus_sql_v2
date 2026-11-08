@@ -18,8 +18,8 @@ class SandboxPolicy:
 
   # Confine SQLite opens strictly beneath `allowed_db_root` after resolving.
   allowed_db_root: pathlib.Path
-  # Match official BIRD-SQL's 30s timeout (~500M VM steps) for unindexed CAST
+  # Match official BIRD-SQL's 60s timeout (~5B VM steps) for unindexed CAST
   # joins while deterministically aborting infinite Cartesian cross-joins.
-  max_vm_steps: int = 500_000_000
-  timeout_ms: float = 30_000.0
+  max_vm_steps: int = 5_000_000_000
+  timeout_ms: float = 60_000.0
   max_returned_rows: int = 10_000

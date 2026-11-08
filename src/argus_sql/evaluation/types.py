@@ -146,7 +146,7 @@ class FeedbackBundle:
     schema_version: Wire format version identifier ('argus_feedback.v1').
     created_utc: ISO-8601 UTC creation timestamp.
     provider: LLM provider identifier ('vertex', 'openai', or 'diagnostic').
-    model_label: Evaluated model slug (e.g., 'gemini-2.5-flash').
+    model_label: Evaluated model slug (e.g., 'gemini-3.7-flash').
     split_name: Evaluated dataset split filename (e.g., 'mini_dev_sqlite.json').
     git_commit: Short Git commit SHA of the evaluated source tree.
     suites: Sanitized BenchmarkSuiteReport tuple (typically Clean + Voice).

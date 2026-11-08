@@ -71,6 +71,22 @@ class VerificationAndArbiterTest(unittest.TestCase):
     # Outer scope lacked WHERE, so `WHERE score IS NOT NULL` must be injected.
     self.assertIn(") WHERE score IS NOT NULL ORDER BY score ASC LIMIT 1", repaired.sql)
 
+    # Inner subquery `ORDER BY ... ASC LIMIT 1` and `UNION ALL` must not inject
+    # duplicate `WHERE` clauses inside parenthesized subqueries or compound arms.
+    inner_order = SQLCandidate(
+        sql="SELECT s FROM (SELECT s FROM frpm WHERE active = 1 ORDER BY s ASC LIMIT 1)",
+        strategy="cot",
+    )
+    inner_issues = audit_candidate_invariants(inner_order, out, intent)
+    self.assertIsNone(apply_algebraic_sql_repairs(inner_order, inner_issues))
+
+    union_order = SQLCandidate(
+        sql="SELECT s FROM frpm UNION ALL SELECT s FROM frpm ORDER BY s ASC LIMIT 1",
+        strategy="cot",
+    )
+    union_issues = audit_candidate_invariants(union_order, out, intent)
+    self.assertIsNone(apply_algebraic_sql_repairs(union_order, union_issues))
+
   def test_invariant_consensus_beats_naive_majority_truncation_trap(self) -> None:
     """Two REAL-cast candidates must beat three integer-truncated candidates."""
     # Construct realistic ratio query where 3/5 samples omit REAL casting.
@@ -133,6 +149,96 @@ class VerificationAndArbiterTest(unittest.TestCase):
     )
     self.assertEqual(
         audit_candidate_invariants(nested_cast, cast_out, ratio_intent), ()
+    )
+
+  def test_avg_and_trailing_float_promotion_and_join_fanout_distinct_repair(
+      self,
+  ) -> None:
+    """AVG()/12 and * 100.0 pass cleanly; parenthesized / and fanout repair."""
+    pct_intent = canonicalize_intent("What is the percentage increase?")
+    # `AVG(x) / 12` and `(a - b) * 100.0 / b` already promote to SQLite REAL.
+    for clean_sql in (
+        "SELECT AVG(Consumption) / 12 FROM yearmonth",
+        "SELECT (c2013 - c2012) * 100.0 / c2012 FROM segs",
+    ):
+      cand = SQLCandidate(clean_sql, "cot")
+      out = ExecutionOutcome(
+          True, ((0,),), ("v",), 1, 0.3, "", compute_result_signature(((0,),))
+      )
+      codes = {
+          i.code for i in audit_candidate_invariants(cand, out, pct_intent)
+      }
+      self.assertNotIn("INTEGER_DIVISION_TRUNCATION", codes)
+
+    # Uncast parenthesized `(c2013 - c2012) * 100 / c2012` must promote cleanly
+    # at zero LLM token cost while guarding division by zero via `NULLIF`.
+    uncast_paren = SQLCandidate(
+        "SELECT (c2013 - c2012) * 100 / c2012 FROM segs", "cot"
+    )
+    p_out = ExecutionOutcome(
+        True, ((0,),), ("v",), 1, 0.3, "", compute_result_signature(((0,),))
+    )
+    p_issues = audit_candidate_invariants(uncast_paren, p_out, pct_intent)
+    p_rep = apply_algebraic_sql_repairs(uncast_paren, p_issues)
+    self.assertIsNotNone(p_rep)
+    assert p_rep is not None
+    self.assertIn(
+        "CAST((c2013 - c2012) * 100 AS REAL) / NULLIF(c2012, 0)", p_rep.sql
+    )
+
+    # 1-to-many join returning duplicate entity names triggers SELECT DISTINCT
+    # so consensus and R-VES favor deduplicated projections.
+    list_intent = canonicalize_intent(
+        "Please list the product descriptions sold in CZE gas stations."
+    )
+    fanout_cand = SQLCandidate(
+        "SELECT T1.Description FROM products T1 JOIN transactions_1k T2 "
+        "ON T1.ProductID = T2.ProductID WHERE T2.Amount > 1",
+        "cot",
+    )
+    # Construct 10 rows containing only 2 distinct values (20% unique <= 50%).
+    dup_rows = (("Nafta",),) * 6 + (("Natural 95",),) * 4
+    fanout_out = ExecutionOutcome(
+        True,
+        dup_rows,
+        ("Description",),
+        len(dup_rows),
+        0.5,
+        "",
+        compute_result_signature(dup_rows),
+    )
+    f_issues = audit_candidate_invariants(fanout_cand, fanout_out, list_intent)
+    self.assertIn("JOIN_FANOUT_DUPLICATES", {i.code for i in f_issues})
+    f_rep = apply_algebraic_sql_repairs(fanout_cand, f_issues)
+    self.assertIsNotNone(f_rep)
+    assert f_rep is not None
+    self.assertTrue(f_rep.sql.startswith("SELECT DISTINCT T1.Description"))
+
+    # Ordered JOIN listings (`ORDER BY`) must NOT trigger SELECT DISTINCT dedup.
+    ordered_fanout = SQLCandidate(
+        "SELECT T1.Description FROM products T1 JOIN transactions_1k T2 "
+        "ON T1.ProductID = T2.ProductID ORDER BY T2.Amount DESC",
+        "cot",
+    )
+    ord_codes = {
+        i.code
+        for i in audit_candidate_invariants(ordered_fanout, fanout_out, list_intent)
+    }
+    self.assertNotIn("JOIN_FANOUT_DUPLICATES", ord_codes)
+
+    # Function-call numerators (`COALESCE`, `CAST(... AS DECIMAL)`) and `NULLIF`
+    # denominators must promote cleanly without double-wrapping `NULLIF`.
+    fn_div = SQLCandidate(
+        "SELECT COALESCE(w.total_cost, 0) / NULLIF(a.attendees, 0) FROM att a",
+        "cot",
+    )
+    fn_issues = audit_candidate_invariants(fn_div, p_out, pct_intent)
+    fn_rep = apply_algebraic_sql_repairs(fn_div, fn_issues)
+    self.assertIsNotNone(fn_rep)
+    assert fn_rep is not None
+    self.assertEqual(
+        fn_rep.sql,
+        "SELECT CAST(COALESCE(w.total_cost, 0) AS REAL) / NULLIF(a.attendees, 0) FROM att a",
     )
 
 

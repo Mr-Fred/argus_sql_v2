@@ -200,10 +200,20 @@ class ArgusSQLPipeline:
         for cand, out in zip(candidates, outcomes, strict=True)
     )
     if not has_clean_candidate and cfg.max_llm_repair_rounds > 0:
-      # Feed exact invariant error codes and DDL context into diagnostic prompt.
+      # Prefer repairing a candidate that parsed & executed in SQLite (e.g., 0
+      # rows or division warning) over an empty or syntax-broken completion.
+      seed_idx = max(
+          range(len(candidates)),
+          key=lambda idx: (
+              outcomes[idx].succeeded,
+              bool(candidates[idx].sql.strip()),
+              -idx,
+          ),
+      )
+      seed_cand = candidates[seed_idx]
       primary_issues = audit_candidate_invariants(
-          candidates[0],
-          outcomes[0],
+          seed_cand,
+          outcomes[seed_idx],
           intent,
           linked,
           cfg.enable_semantic_verifier,
@@ -213,7 +223,7 @@ class ArgusSQLPipeline:
             intent.canonical_question,
             task.evidence,
             linked.ddl_prompt,
-            candidates[0],
+            seed_cand,
             primary_issues,
         )
         rep_req = LLMCompletionRequest(

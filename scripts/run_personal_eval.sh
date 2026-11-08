@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Runs live BIRD-SQL evaluation on your PERSONAL computer and emits a
+# Runs live BIRD-SQL evaluation on your PERSONAL computer or Linux VM (defaults
+# to GOOGLE_CLOUD_LOCATION=global and gemini-3.7-flash on Vertex AI) and emits a
 # clean-room-verified, path-scrubbed, SHA-256-signed feedback bundle ready
 # to push or copy back to the credential-free authoring workspace.
 set -euo pipefail
