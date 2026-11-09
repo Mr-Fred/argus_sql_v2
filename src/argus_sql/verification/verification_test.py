@@ -550,6 +550,16 @@ class VerificationAndArbiterTest(unittest.TestCase):
     self.assertEqual(
         audit_candidate_invariants(ts_rep, out_good, ts_intent, linked_ts), ()
     )
+    # Quoted table aliases (`AS "U"`) and `IN ('YYYY-MM-DD', ...)` also rewrite!
+    in_ts = SQLCandidate(
+        'SELECT COUNT(*) FROM users AS "U" WHERE LastAccessDate IN (\'2014-09-01\', \'2014-09-02\')',
+        "formula_defensive",
+    )
+    in_issues = audit_candidate_invariants(in_ts, out_bad, ts_intent, linked_ts)
+    self.assertEqual([i.code for i in in_issues], ["TIMESTAMP_BARE_DATE_COMPARISON"])
+    in_rep = apply_algebraic_sql_repairs(in_ts, in_issues, linked_ts)
+    assert in_rep is not None
+    self.assertIn("DATE(LastAccessDate) IN ('2014-09-01', '2014-09-02')", in_rep.sql)
 
     # 2. `MISSING_WINDOW_RANK` (I12) flags imperative `Rank X by Y` queries
     #    missing `RANK() OVER (...)`, without false-alarming on `did X rank highest?`.

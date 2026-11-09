@@ -302,6 +302,28 @@ class LinkingModuleTest(unittest.TestCase):
     )
     self.assertEqual(rank_intent.expected_projection_arity, 3)
 
+    # Noun-phrase 'Which kind of', 'no. of' abbreviations, and conditional `?`.
+    self.assertEqual(
+        canonicalize_intent("Which kind of credit card does client 9 possess?").canonical_question,
+        "Which kind of credit card does client 9 possess?",
+    )
+    self.assertEqual(
+        canonicalize_intent("List out the no. of districts with salary > 6000?").canonical_question,
+        "List out the no. of districts with salary > 6000?",
+    )
+    self.assertEqual(
+        canonicalize_intent(
+            "is it true that more smes pay in koruna? if so, how many more"
+        ).canonical_question,
+        "Is it true that more smes pay in koruna? If so, how many more?",
+    )
+    self.assertEqual(
+        canonicalize_intent(
+            "rank schools by writing score where score > 499, showing charter numbers"
+        ).canonical_question,
+        "Rank schools by writing score where score > 499, showing charter numbers.",
+    )
+
     # 3. Hierarchy cardinality disambiguation (`County` 58 vs `City`/`MailCity` 500)
     #    and parenthetical column-qualifier (`K-12`) suppression.
     geo_schema = DatabaseSchema(

@@ -9,9 +9,17 @@ voice utterances align faithfully with clean written queries.
 import re
 
 # Spoken filler phrases ordered longest-first to avoid partial residue.
+# Guards `sort of`/`kind of` after interrogative/determiner words so noun
+# phrases ('Which kind of credit card') are never corrupted.
 _DISFLUENCY_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"\b(?:uh+|um+|er+|ah+|hmm+)\b[,\s]*", re.IGNORECASE),
-    re.compile(r"\b(?:you know|i mean|sort of|kind of)\b[,\s]*", re.IGNORECASE),
+    re.compile(r"\b(?:you know|i mean)\b[,\s]*", re.IGNORECASE),
+    re.compile(
+        r"(?<!\bwhat\s)(?<!\bwhich\s)(?<!\bany\s)(?<!\bsame\s)"
+        r"(?<!\bthis\s)(?<!\bthat\s)(?<!\ba\s)"
+        r"\b(?:sort of|kind of)\b[,\s]*",
+        re.IGNORECASE,
+    ),
     re.compile(
         r"^(?:hey\s+|okay\s+|so\s+|well\s+|please\s+)*"
         r"(?:can you\s+|could you\s+)?(?:please\s+)?"
@@ -63,6 +71,13 @@ _INTERROGATIVE_HEAD_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Matches imperative/declarative directives that end with `.` rather than `?`.
+_IMPERATIVE_CLAUSE_RE = re.compile(
+    r"(?:^|,\s*)(?:please\s+)?(?:list|give|show|find|rank|calculate|state"
+    r"|identify|indicate|provide|describe|name)\b",
+    re.IGNORECASE,
+)
+
 
 def normalize_spoken_numbers(text: str) -> str:
   """Converts spoken number tokens after limit/comparison words into digits.
@@ -109,6 +124,11 @@ def align_asr_casing_and_punctuation(
   if not cleaned:
     return cleaned
 
+  # Mixed-case written queries already carry author casing and punctuation;
+  # only capitalize the opening character in case a wake-phrase was stripped.
+  if raw_question != raw_question.lower():
+    return cleaned[0].upper() + cleaned[1:]
+
   # Align lowercase ASR entity/code spans ('tr004_8_9', 'marvel comics', 'dc')
   # with canonical casing attested in external `evidence`.
   if evidence:
@@ -133,7 +153,6 @@ def align_asr_casing_and_punctuation(
           and (
               any(ch.isdigit() for ch in tok)
               or "_" in tok
-              or "-" in tok
               or any(ch.isupper() for ch in tok[1:])
           )
       )
@@ -149,21 +168,28 @@ def align_asr_casing_and_punctuation(
           flags=re.IGNORECASE,
       )
 
-  # Capitalize both the opening character and any sentence after `.`, `?`, `!`.
+  # Capitalize opening char and sentence boundaries while skipping 'no.'/'vs.'.
   cleaned = re.sub(
-      r"(^|[.?!]\s+)([a-z])",
+      r"(^|(?<!\bno)(?<!\bvs)(?<!\bdr)(?<!\bmr)(?<!\bms)(?<!\bst)[.?!]\s+)([a-z])",
       lambda m: m.group(1) + m.group(2).upper(),
       cleaned,
+      flags=re.IGNORECASE,
   )
 
   # Restore terminal `?` or `.` when lowercase ASR stripped ending punctuation.
-  if raw_question == raw_question.lower() and cleaned[-1] not in ".?!;":
-    last_seg = re.split(r"[.?!]\s+", cleaned)[-1].strip()
+  if cleaned[-1] not in ".?!;":
+    last_seg = re.split(
+        r"(?<!\bno)(?<!\bvs)(?<!\bdr)(?<!\bmr)(?<!\bms)(?<!\bst)[.?!]\s+",
+        cleaned,
+        flags=re.IGNORECASE,
+    )[-1].strip()
     is_question = bool(_INTERROGATIVE_HEAD_RE.match(last_seg)) or (
-        "?" not in cleaned
+        _IMPERATIVE_CLAUSE_RE.search(last_seg) is None
         and bool(
             re.search(
-                r"\b(?:what|which|who|where|when|how\s+many|how\s+much)\b",
+                r"(?:^|,\s*|\band\s+|\bon\s+average\s+|\bon\s+)"
+                r"(?:if\s+so,\s*|if\s+not,\s*|otherwise,\s*)?"
+                r"(?:what|which|who|whom|whose|where|when|why|how)\b",
                 last_seg,
                 re.IGNORECASE,
             )

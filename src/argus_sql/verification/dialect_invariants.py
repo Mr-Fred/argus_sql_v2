@@ -40,15 +40,16 @@ _PURE_DATE_RANGE_RE = re.compile(
 
 # SQL clause keywords excluded from implicit table alias capture.
 _SQL_CLAUSE_KW = (
-    r"(?:WHERE|ON|INNER|LEFT|RIGHT|FULL|CROSS|JOIN|GROUP|ORDER|HAVING"
-    r"|LIMIT|UNION|INTERSECT|EXCEPT|SET|VALUES|WINDOW)"
+    r"(?:AS|WHERE|ON|INNER|LEFT|RIGHT|FULL|CROSS|OUTER|NATURAL|INDEXED|JOIN"
+    r"|GROUP|ORDER|HAVING|LIMIT|UNION|INTERSECT|EXCEPT|SET|VALUES|WINDOW)"
 )
 
 # Extracts `FROM/JOIN <table> [[AS] <alias>]` bindings for column resolution.
 _TABLE_ALIAS_RE = re.compile(
     r"\b(?:FROM|JOIN)\s+"
     r'(?:"((?:""|[^"])+)"|`((?:``|[^`])+)`|\[([^\]]+)\]|([a-zA-Z_][a-zA-Z0-9_]*))'
-    rf"(?:\s+(?:AS\s+)?(?!{_SQL_CLAUSE_KW}\b)([a-zA-Z_][a-zA-Z0-9_]*))?",
+    rf"(?:\s+(?:AS\s+)?(?!{_SQL_CLAUSE_KW}\b)"
+    r'(?:"((?:""|[^"])+)"|`((?:``|[^`])+)`|\[([^\]]+)\]|([a-zA-Z_][a-zA-Z0-9_]*)))?',
     re.IGNORECASE,
 )
 
@@ -60,7 +61,8 @@ _STRING_OR_BARE_DATE_CMP_RE = re.compile(
     r"((?:([a-zA-Z_][a-zA-Z0-9_]*)\.)?"
     r'(?:"((?:""|[^"])+)"|`((?:``|[^`])+)`|\[([^\]]+)\]|([a-zA-Z_][a-zA-Z0-9_]*)))'
     r"\s*(?:(?:=|!=|<>|>|<=)\s*'\d{4}-\d{2}-\d{2}'"
-    r"|(?:NOT\s+)?BETWEEN\s+'\d{4}-\d{2}-\d{2}'\s+AND\s+'\d{4}-\d{2}-\d{2}')",
+    r"|(?:NOT\s+)?BETWEEN\s+'\d{4}-\d{2}-\d{2}'\s+AND\s+'\d{4}-\d{2}-\d{2}'"
+    r"|(?:NOT\s+)?IN\s*\(\s*'\d{4}-\d{2}-\d{2}'(?:\s*,\s*'\d{4}-\d{2}-\d{2}')*\s*\))",
     re.IGNORECASE,
 )
 
@@ -132,8 +134,10 @@ def _extract_table_alias_map(sql_text: str) -> dict[str, str]:
       continue
     # Register both physical table name and optional SQL alias in lowercase.
     alias_map.setdefault(tbl_low, tbl_low)
-    if m.group(5):
-      alias_map[m.group(5).lower()] = tbl_low
+    raw_alias = m.group(5) or m.group(6) or m.group(7) or m.group(8) or ""
+    alias_low = raw_alias.replace('""', '"').replace("``", "`").lower()
+    if alias_low:
+      alias_map[alias_low] = tbl_low
   return alias_map
 
 
