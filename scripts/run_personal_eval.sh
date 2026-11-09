@@ -30,10 +30,17 @@ PATH_SEP="$(run_py -c 'import os, sys; sys.stdout.write(os.pathsep)')"
 export PYTHONPATH="${REPO_ROOT}/src${PYTHONPATH:+${PATH_SEP}${PYTHONPATH}}"
 
 BIRD_DIR="${ARGUS_BIRD_DIR:-data/bird/mini_dev}"
-QUESTIONS_FILE="${ARGUS_QUESTIONS_FILE:-mini_dev_sqlite.json}"
+QUESTIONS_FILE="${ARGUS_QUESTIONS:-${ARGUS_QUESTIONS_FILE:-mini_dev_sqlite.json}}"
 PROVIDER="${ARGUS_PROVIDER:-auto}"
 MODEL="${ARGUS_MODEL:-${ARGUS_LLM_MODEL:-auto}}"
-LIMIT="${ARGUS_LIMIT:-0}"
+LIMIT="${ARGUS_LIMIT:-22}"
+CONCURRENCY="${ARGUS_CONCURRENCY:-16}"
+STRATIFIED="${ARGUS_STRATIFIED:-1}"
+
+STRAT_FLAG=()
+if [ "${STRATIFIED}" = "1" ] || [ "${STRATIFIED}" = "true" ]; then
+  STRAT_FLAG=(--stratified)
+fi
 
 echo "[1/4] Bootstrapping local clean-room Git hooks..."
 run_py -m argus_sql.guardrails.cli --repo-root "${REPO_ROOT}" --bootstrap-git --verify-all
@@ -44,7 +51,7 @@ if [ ! -d "${BIRD_DIR}" ]; then
   exit 1
 fi
 
-echo "[2/4] Running live BIRD-SQL evaluation (provider=${PROVIDER}, model=${MODEL}, limit=${LIMIT})..."
+echo "[2/4] Running live BIRD-SQL evaluation (provider=${PROVIDER}, model=${MODEL}, limit=${LIMIT}, concurrency=${CONCURRENCY}, stratified=${STRATIFIED})..."
 run_py -m argus_sql.evaluation.cli \
   --mode bird \
   --bird-dir "${BIRD_DIR}" \
@@ -52,8 +59,11 @@ run_py -m argus_sql.evaluation.cli \
   --provider "${PROVIDER}" \
   --model "${MODEL}" \
   --limit "${LIMIT}" \
+  --task-concurrency "${CONCURRENCY}" \
+  --checkpoint-dir "${REPO_ROOT}/results/live_runs" \
   --latex-out-dir "${REPO_ROOT}/paper/tables" \
   --feedback-out-dir "${REPO_ROOT}/results/feedback" \
+  "${STRAT_FLAG[@]}" \
   "$@"
 
 echo "[3/4] Scanning exported feedback bundle & LaTeX table for zero leaks..."

@@ -104,7 +104,7 @@ class VertexGeminiBatchClient:
       project_id: str,
       model_name: str = "gemini-3.7-flash",
       location: str = "global",
-      max_concurrency: int = 8,
+      max_concurrency: int = 24,
       timeout_sec: float = 120.0,
       min_output_tokens: int = 8192,
       max_retries: int = 3,

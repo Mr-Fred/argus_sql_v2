@@ -24,6 +24,9 @@ from argus_sql.evaluation.feedback_triage import export_feedback_artifacts
 from argus_sql.evaluation.latex_exporter import escape_latex_text
 from argus_sql.evaluation.latex_exporter import render_comparative_latex_table
 from argus_sql.evaluation.latex_exporter import serialize_reports_to_json
+from argus_sql.evaluation.live_checkpoint import LiveRunCheckpointer
+from argus_sql.evaluation.live_checkpoint import resolve_checkpoint_path
+from argus_sql.evaluation.live_checkpoint import select_stratified_bird_tasks
 from argus_sql.evaluation.mini_bird_databases import materialize_mini_bird_databases
 from argus_sql.evaluation.mini_bird_suite import build_ablation_systems
 from argus_sql.evaluation.mini_bird_suite import build_main_systems
@@ -98,101 +101,80 @@ def main(argv: Sequence[str] | None = None) -> int:
       description="Argus-SQL Comparative Benchmark & Ablation Runner."
   )
   parser.add_argument(
-      "--mode",
-      choices=("diagnostic", "bird"),
-      default="diagnostic",
+      "--mode", choices=("diagnostic", "bird"), default="diagnostic",
       help="Run hermetic Mini-BIRD diagnostic suite or live public BIRD split.",
   )
   # Public BIRD-SQL / Mini-Dev dataset path and split filename parameters.
   parser.add_argument(
-      "--bird-dir",
-      type=pathlib.Path,
-      default=None,
+      "--bird-dir", type=pathlib.Path, default=None,
       help="Path to downloaded public BIRD-SQL dev or mini-dev directory.",
   )
   parser.add_argument(
-      "--questions-filename",
-      type=str,
-      default="dev.json",
+      "--questions-filename", type=str, default="dev.json",
       help="Questions JSON/JSONL file (`dev.json` or `mini_dev_sqlite.json`).",
   )
   parser.add_argument(
-      "--tables-filename",
-      type=str,
-      default="dev_tables.json",
+      "--tables-filename", type=str, default="dev_tables.json",
       help="Schema metadata JSON file (`dev_tables.json`).",
   )
   parser.add_argument(
-      "--databases-subdir",
-      type=str,
-      default="dev_databases",
+      "--databases-subdir", type=str, default="dev_databases",
       help="Relative subdirectory under `--bird-dir` holding `<db>/<db>.sqlite`.",
   )
   # Live LLM adapter routing (Vertex AI / Gemini Enterprise vs. OpenAI/vLLM).
   parser.add_argument(
-      "--provider",
-      choices=("auto", "openai", "vertex"),
-      default="auto",
+      "--provider", choices=("auto", "openai", "vertex"), default="auto",
       help="Live LLM transport (`auto` uses Vertex AI when GCP env is set).",
   )
   parser.add_argument(
-      "--gcp-project",
-      type=str,
-      default=None,
+      "--gcp-project", type=str, default=None,
       help="Google Cloud project ID for Vertex AI / Gemini Enterprise.",
   )
   parser.add_argument(
-      "--gcp-location",
-      type=str,
-      default=None,
+      "--gcp-location", type=str, default=None,
       help="Vertex AI location (`global` by default or regional slug).",
   )
   parser.add_argument(
-      "--model",
-      type=str,
-      default="auto",
+      "--model", type=str, default="auto",
       help="Model identifier (`auto` selects `gemini-3.7-flash` or `gpt-4o-mini`).",
   )
   parser.add_argument(
-      "--endpoint-url",
-      type=str,
+      "--endpoint-url", type=str,
       default="https://api.openai.com/v1/chat/completions",
       help="HTTPS or localhost OpenAI-compatible chat completions endpoint.",
   )
   # Execution subsetting, concurrency, and confined LaTeX/JSON output paths.
   parser.add_argument(
-      "--only-argus",
-      action="store_true",
+      "--only-argus", action="store_true",
       help="Evaluate only Argus-SQL (skip B0..B3 baselines) for fast smoke runs.",
   )
   parser.add_argument(
-      "--latex-out-dir",
-      type=pathlib.Path,
-      default=pathlib.Path("paper/tables"),
+      "--stratified", action="store_true",
+      help="Select a difficulty-balanced round-robin slice across all databases.",
+  )
+  parser.add_argument(
+      "--checkpoint-dir", type=pathlib.Path, default=pathlib.Path("results/live_runs"),
+      help="Directory for incremental per-task JSONL checkpoints (`results/live_runs`).",
+  )
+  parser.add_argument(
+      "--latex-out-dir", type=pathlib.Path, default=pathlib.Path("paper/tables"),
       help="Directory where generated `.tex` booktabs tables are saved.",
   )
   parser.add_argument(
-      "--json-out-dir",
-      type=pathlib.Path,
-      default=pathlib.Path("results"),
+      "--json-out-dir", type=pathlib.Path, default=pathlib.Path("results"),
       help="Directory where structured JSON benchmark reports are saved.",
   )
   parser.add_argument(
-      "--feedback-out-dir",
-      type=pathlib.Path,
+      "--feedback-out-dir", type=pathlib.Path,
       default=pathlib.Path("results/feedback"),
       help="Directory where sanitized CI/CD feedback bundles & triage reports go.",
   )
   parser.add_argument(
-      "--limit",
-      type=int,
-      default=0,
+      "--limit", type=int, default=0,
       help="Optional cap on number of BIRD tasks evaluated (0 = all).",
   )
   parser.add_argument(
-      "--task-concurrency",
-      type=int,
-      default=4,
+      "--task-concurrency", type=int, default=8,
       help="Parallel task workers in `--mode bird` (bounded by LLM pool).",
   )
   args = parser.parse_args(argv)
@@ -279,10 +261,14 @@ def main(argv: Sequence[str] | None = None) -> int:
       databases_subdir=args.databases_subdir,
   )
   # Filter to materialized `.sqlite` files BEFORE slicing `--limit` so partial
-  # BIRD downloads (e.g., single-database subsets) evaluate the requested cap.
+  # BIRD downloads or stratified slices evaluate across available databases.
   tasks = tuple(t for t in tasks if t.db_id in sqlite_paths)
   if args.limit > 0:
-    tasks = tasks[: args.limit]
+    tasks = (
+        select_stratified_bird_tasks(tasks, args.limit)
+        if args.stratified
+        else tasks[: args.limit]
+    )
   # Generate paired spoken ASR-perturbed Voice-BIRD tasks for robustness eval.
   voice_tasks = tuple(perturb_task_for_voice(t) for t in tasks)
 
@@ -300,6 +286,20 @@ def main(argv: Sequence[str] | None = None) -> int:
       gcp_project=args.gcp_project,
       gcp_location=args.gcp_location,
   )
+  model_label = str(getattr(llm_client, "model_name", args.model))
+  provider_label = str(getattr(llm_client, "provider_name", args.provider))
+
+  # Initialize persistent per-task JSONL checkpointer in `results/live_runs/`.
+  ckpt_path = resolve_checkpoint_path(
+      args.checkpoint_dir,
+      split_name=args.questions_filename,
+      provider=provider_label,
+      model_label=model_label,
+      limit=args.limit,
+      stratified=args.stratified,
+  )
+  checkpointer = LiveRunCheckpointer(ckpt_path)
+
   # Support `--only-argus` for rapid low-token smoke checks on live endpoints.
   pipes: tuple[NL2SQLPipeline, ...] = (
       (ArgusSQLPipeline(llm_client, sandbox, ArgusAblationConfig(system_name="Argus-SQL")),)
@@ -315,6 +315,7 @@ def main(argv: Sequence[str] | None = None) -> int:
       sqlite_paths,
       sandbox,
       max_workers=args.task_concurrency,
+      checkpointer=checkpointer,
   )
   voice_rep = run_benchmark_suite(
       "BIRD-Dev Voice",
@@ -324,10 +325,9 @@ def main(argv: Sequence[str] | None = None) -> int:
       sqlite_paths,
       sandbox,
       max_workers=args.task_concurrency,
+      checkpointer=checkpointer,
   )
   # Render publication-ready booktabs LaTeX table (`bird_live.tex`) and JSON.
-  model_label = str(getattr(llm_client, "model_name", args.model))
-  provider_label = str(getattr(llm_client, "provider_name", args.provider))
   safe_model_tex = escape_latex_text(model_label)
   bird_tex = render_comparative_latex_table(
       clean_rep,

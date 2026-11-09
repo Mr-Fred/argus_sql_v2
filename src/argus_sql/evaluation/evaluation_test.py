@@ -594,6 +594,48 @@ class EvaluationModuleTest(unittest.TestCase):
       self.assertEqual(rc_ver, 0)
       self.assertIn("Verified 1 feedback bundle(s)", ver_out.getvalue())
 
+  def test_stratified_sampling_and_live_run_checkpoint_resume(self) -> None:
+    """Stratified sampling spans all DBs/tiers and checkpoints skip LLM re-runs."""
+    from argus_sql.evaluation.live_checkpoint import LiveRunCheckpointer
+    from argus_sql.evaluation.live_checkpoint import resolve_checkpoint_path
+    from argus_sql.evaluation.live_checkpoint import select_stratified_bird_tasks
+
+    clean_tasks = build_mini_bird_clean_tasks()
+    # Selecting 3 tasks from 3 databases must pick exactly 1 per DB across all 3 tiers.
+    strat_slice = select_stratified_bird_tasks(clean_tasks, limit=3)
+    self.assertEqual(len(strat_slice), 3)
+    self.assertEqual(len({t.db_id for t in strat_slice}), 3)
+    self.assertEqual(len({t.difficulty for t in strat_slice}), 3)
+
+    with tempfile.TemporaryDirectory() as tmp:
+      root = pathlib.Path(tmp)
+      schemas, paths = materialize_mini_bird_databases(root)
+      sandbox = SQLiteReadOnlySandbox(SandboxPolicy(allowed_db_root=root))
+      ckpt_file = resolve_checkpoint_path(
+          root / "live_runs", "mini_dev_sqlite.json", "vertex", "gemini-3.7-flash", 3, True
+      )
+      ckpt = LiveRunCheckpointer(ckpt_file)
+      synth = SchemaGuidedDiagnosticSynthesizer()
+      pipe = ArgusSQLPipeline(synth, sandbox)
+
+      # First run writes 3 records to disk.
+      rep1 = run_benchmark_suite(
+          "Clean", strat_slice, (pipe,), schemas, paths, sandbox, checkpointer=ckpt
+      )
+      self.assertTrue(ckpt_file.is_file())
+      # Reloading from disk must replay all 3 records without invoking `predict`.
+      reloaded_ckpt = LiveRunCheckpointer(ckpt_file)
+      rep2 = run_benchmark_suite(
+          "Clean",
+          strat_slice,
+          (pipe,),
+          schemas,
+          paths,
+          sandbox,
+          checkpointer=reloaded_ckpt,
+      )
+      self.assertEqual(rep1.summaries[0].ex_overall, rep2.summaries[0].ex_overall)
+
 
 if __name__ == "__main__":
   unittest.main()

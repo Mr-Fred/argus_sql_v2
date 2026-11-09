@@ -15,6 +15,7 @@ from argus_sql.contracts.types import NLQueryTask
 from argus_sql.evaluation.bird_metrics import evaluate_prediction
 from argus_sql.evaluation.bird_metrics import summarize_system_records
 from argus_sql.evaluation.exceptions import BenchmarkDatasetError
+from argus_sql.evaluation.live_checkpoint import LiveRunCheckpointer
 # Re-export task builders so callers importing from `mini_bird_suite` work seamlessly.
 from argus_sql.evaluation.mini_bird_tasks import build_mini_bird_clean_tasks
 from argus_sql.evaluation.mini_bird_tasks import build_voice_bird_tasks
@@ -126,6 +127,7 @@ def run_benchmark_suite(
     sqlite_paths: dict[str, pathlib.Path],
     sandbox: SQLiteReadOnlySandbox,
     max_workers: int = 1,
+    checkpointer: LiveRunCheckpointer | None = None,
 ) -> BenchmarkSuiteReport:
   """Evaluates all `pipelines` across `tasks` with shared 3-gram value caches.
 
@@ -138,6 +140,7 @@ def run_benchmark_suite(
     sandbox: Read-only SQLite execution sandbox.
     max_workers: Concurrent task worker count (`1` for hermetic micro-benchmarks;
       `>1` for parallel network batching on live BIRD splits).
+    checkpointer: Optional persistent JSONL checkpointer in `results/live_runs/`.
 
   Returns:
     BenchmarkSuiteReport containing SystemEvalSummary rows and task traces.
@@ -180,7 +183,7 @@ def run_benchmark_suite(
   # Collect per-system summary rows and full task-level records for export.
   summaries: list[SystemEvalSummary] = []
   records_by_sys: list[tuple[str, tuple[TaskEvalRecord, ...]]] = []
-  eff_workers = max(1, min(max_workers, 16))
+  eff_workers = max(1, min(max_workers, 32))
 
   # Evaluate each pipeline over the exact same frozen task set.
   for pipeline in pipelines:
@@ -189,7 +192,15 @@ def run_benchmark_suite(
         task: NLQueryTask,
         active_pipe: NL2SQLPipeline = pipeline,
     ) -> TaskEvalRecord:
-      """Runs prediction and sandbox EX/R-VES evaluation for a single task."""
+      """Runs prediction and sandbox EX/R-VES evaluation with disk checkpointing."""
+      # Return pre-checkpointed task evaluation immediately if present on disk.
+      if checkpointer is not None:
+        cached_rec = checkpointer.get(
+            suite_name, active_pipe.system_name, task.question_id
+        )
+        if cached_rec is not None:
+          return cached_rec
+
       db_file = sqlite_paths[task.db_id]
       pred = active_pipe.predict(
           task=task,
@@ -197,9 +208,13 @@ def run_benchmark_suite(
           db_path=db_file,
           value_retriever=retrievers[task.db_id],
       )
-      return evaluate_prediction(
+      rec = evaluate_prediction(
           task, pred, db_file, sandbox, gold_outcome=gold_by_qid[task.question_id]
       )
+      # Flush newly completed evaluation to `results/live_runs/` immediately.
+      if checkpointer is not None:
+        checkpointer.record(suite_name, active_pipe.system_name, rec)
+      return rec
 
     # Dispatch tasks concurrently on live network runs while preserving 1-to-1 order.
     if eff_workers > 1 and len(active_tasks) > 1:

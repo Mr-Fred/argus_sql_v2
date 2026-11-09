@@ -24,6 +24,10 @@ from argus_sql.evaluation.feedback_triage import render_feedback_triage_markdown
 from argus_sql.evaluation.latex_exporter import escape_latex_text
 from argus_sql.evaluation.latex_exporter import render_comparative_latex_table
 from argus_sql.evaluation.latex_exporter import serialize_reports_to_json
+# Re-export persistent JSONL checkpointing and stratified multi-DB sampling.
+from argus_sql.evaluation.live_checkpoint import LiveRunCheckpointer
+from argus_sql.evaluation.live_checkpoint import resolve_checkpoint_path
+from argus_sql.evaluation.live_checkpoint import select_stratified_bird_tasks
 # Re-export diagnostic SQLite database builders and benchmark suite runner.
 from argus_sql.evaluation.mini_bird_databases import materialize_mini_bird_databases
 from argus_sql.evaluation.mini_bird_suite import build_mini_bird_clean_tasks
@@ -44,6 +48,7 @@ __all__ = [
     "EvaluationError",
     "FailureCluster",
     "FeedbackBundle",
+    "LiveRunCheckpointer",
     "SystemEvalSummary",
     "TaskEvalRecord",
     "VoiceDriftCase",
@@ -64,8 +69,10 @@ __all__ = [
     "perturb_task_for_voice",
     "render_comparative_latex_table",
     "render_feedback_triage_markdown",
+    "resolve_checkpoint_path",
     "run_benchmark_suite",
     "sanitize_diagnostic_text",
+    "select_stratified_bird_tasks",
     "serialize_reports_to_json",
     "summarize_system_records",
 ]
