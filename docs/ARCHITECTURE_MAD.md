@@ -60,13 +60,13 @@ argus_sql/
 │   └── feedback/                     # SHA-256-verified sanitized feedback bundles
 └── src/argus_sql/
     ├── guardrails/                   # Clean-room IP/secret scanner & AST verifier
-    ├── contracts/                    # Pure domain dataclasses & composite-PK DDL
+    ├── contracts/                    # Pure domain dataclasses & range/composite-PK DDL
     ├── linking/                      # Voice canon., 3-gram/code index & FK/junction graph
     ├── sandbox/                      # Read-only authorizer-locked SQLite sandbox
-    ├── verification/                 # 7 SQLite invariants, algebraic repair & vote
+    ├── verification/                 # 7 SQLite invariants, range/alg. repair & vote
     ├── adapters/                     # Vertex/OpenAI batch HTTPS & DDL synthesizer
     ├── pipelines/                    # B0, B1, B2, B3 baselines & Argus-SQL hybrid
-    └── evaluation/                   # BIRD EX/R-VES, CSV/SQLite hydration & triage
+    └── evaluation/                   # BIRD EX/R-VES, MIN..MAX/CSV hydration & triage
 ```
 
 ---

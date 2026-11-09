@@ -16,12 +16,13 @@ class VerifierConfig:
     strategy_diversity_bonus: Bonus added per distinct agreeing strategy.
   """
 
-  # Multiplicative penalty `0.28` ensures 2 clean votes beat 3 truncated votes.
+  # Multiplicative penalty `0.18` ensures 1 clean repair (1.00) beats 3-4
+  # correlated empty-set or integer-truncated candidates (3 * 0.18 = 0.54).
   enable_semantic_invariants: bool = True
   enable_algebraic_repair: bool = True
-  error_issue_multiplier: float = 0.28
+  error_issue_multiplier: float = 0.18
   warning_issue_multiplier: float = 0.65
-  # Small diversity bonus (`0.15`) breaks ties in favor of orthogonal strategies.
+  # Small diversity bonus (`0.15`) breaks ties across error-free strategies.
   strategy_diversity_bonus: float = 0.15
 
 

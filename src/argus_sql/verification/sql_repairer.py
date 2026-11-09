@@ -157,6 +157,17 @@ def apply_algebraic_sql_repairs(
   issue_codes = {item.code for item in issues}
   repaired = candidate.sql.strip().rstrip(";")
 
+  # 0. Rewrite non-SQLite `ILIKE` operator outside single-quoted literals.
+  if "EXECUTION_ERROR" in issue_codes and re.search(
+      r"\bILIKE\b", repaired, re.IGNORECASE
+  ):
+    repaired = re.sub(
+        r"('(?:''|[^'])*')|\bILIKE\b",
+        lambda m: m.group(1) if m.group(1) is not None else "LIKE",
+        repaired,
+        flags=re.IGNORECASE,
+    )
+
   # 1. Promote uncast `lhs / rhs` (SELECT and ORDER BY) while skipping literals.
   if "INTEGER_DIVISION_TRUNCATION" in issue_codes:
     repaired = _rewrite_uncast_divisions(repaired)
@@ -173,19 +184,41 @@ def apply_algebraic_sql_repairs(
       if updated_prefix is not None:
         repaired = f"{updated_prefix} {suffix}"
 
-  # 3. Substitute ungrounded abbreviated string literals using high-score ValueMatch.
-  if "EMPTY_RESULT_ANOMALY" in issue_codes and linked_schema is not None:
+  # 3. Substitute abbreviated or mis-cased string literals on empty/all-NULL rows.
+  # Tokenize single-quoted literals in one pass and preserve exact DB matches so
+  # lower-scoring prefix hits ('Alameda Unified') never clobber exact ('Alameda')!
+  if (
+      issue_codes & {"EMPTY_RESULT_ANOMALY", "ALL_NULL_RESULT_ANOMALY"}
+      and linked_schema is not None
+      and linked_schema.value_matches
+  ):
+    exact_cased_vals = {
+        vm.matched_value
+        for vm in linked_schema.value_matches
+        if vm.similarity_score >= 0.99
+    }
+    lit_replacements: dict[str, str] = {}
     for vm in linked_schema.value_matches:
-      if vm.similarity_score >= 0.75 and vm.query_span != vm.matched_value:
-        quoted_span = f"'{vm.query_span}'"
-        if quoted_span.lower() in repaired.lower():
-          escaped_val = vm.matched_value.replace("'", "''")
-          repaired = re.sub(
-              re.escape(quoted_span),
-              f"'{escaped_val}'",
-              repaired,
-              flags=re.IGNORECASE,
-          )
+      if vm.similarity_score < 0.75:
+        continue
+      for raw_probe in (vm.matched_value, vm.query_span):
+        if raw_probe:
+          lit_replacements.setdefault(raw_probe.lower(), vm.matched_value)
+
+    if lit_replacements:
+
+      def _rewrite_sql_string_literal(match: re.Match[str]) -> str:
+        """Replaces one single-quoted SQL literal if abbreviated or mis-cased."""
+        tok = match.group(0)
+        inner = tok[1:-1].replace("''", "'")
+        if inner in exact_cased_vals:
+          return tok
+        target = lit_replacements.get(inner.lower())
+        if target is not None and target != inner:
+          return "'" + target.replace("'", "''") + "'"
+        return tok
+
+      repaired = re.sub(r"'(?:''|[^'])*'", _rewrite_sql_string_literal, repaired)
 
   # 4. Deduplicate 1-to-many entity-listing join fanout via `SELECT DISTINCT`.
   if "JOIN_FANOUT_DUPLICATES" in issue_codes and re.match(
@@ -215,6 +248,7 @@ def build_diagnostic_repair_prompt(
     ddl_prompt: str,
     candidate: SQLCandidate,
     issues: Sequence[InvariantIssue],
+    failed_sqls: Sequence[str] = (),
 ) -> str:
   """Formats an execution + semantic invariant repair prompt for an LLM refiner.
 
@@ -224,6 +258,8 @@ def build_diagnostic_repair_prompt(
     ddl_prompt: Linked `CREATE TABLE` DDL schema context.
     candidate: Failing or invariant-violating SQLCandidate.
     issues: Diagnostic InvariantIssue items guiding the repair.
+    failed_sqls: Optional sibling failed SQL strings so the refiner avoids
+      repeating predicates that already returned 0 rows or failed.
 
   Returns:
     Structured prompt requesting a single corrected SQLite SELECT query.
@@ -233,11 +269,30 @@ def build_diagnostic_repair_prompt(
       f"- [{iss.code}] {iss.message} Fix: {iss.repair_hint}" for iss in issues
   )
   ev_line = f"\nExternal Evidence: {evidence}" if evidence else ""
+
+  # Surface distinct sibling failed SQLs (capped to 2) to prevent empty-set loops.
+  seed_norm = candidate.sql.strip()
+  other_failed: list[str] = []
+  for alt_sql in failed_sqls:
+    cleaned_alt = alt_sql.strip()
+    if cleaned_alt and cleaned_alt != seed_norm and cleaned_alt not in other_failed:
+      other_failed.append(cleaned_alt)
+    if len(other_failed) >= 2:
+      break
+  alt_block = ""
+  if other_failed:
+    joined_alts = "\n---\n".join(other_failed)
+    alt_block = (
+        "\n\nOther Failed SQL Attempts (do not repeat these predicates):\n"
+        f"{joined_alts}"
+    )
+
   return (
       "You are repairing a SQLite query that failed semantic or execution checks.\n\n"
       f"Database Schema:\n{ddl_prompt}\n\n"
       f"Question: {question}{ev_line}\n\n"
-      f"Previous SQL:\n{candidate.sql}\n\n"
+      f"Previous SQL:\n{candidate.sql}{alt_block}\n\n"
       f"Detected Issues:\n{bullet_lines}\n\n"
-      "Return ONLY the corrected SQLite SELECT query with no markdown prose."
+      "Return ONLY the corrected read-only SQLite SELECT query inside a "
+      "```sql ... ``` code block."
   )

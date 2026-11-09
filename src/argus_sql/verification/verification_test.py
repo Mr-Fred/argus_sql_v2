@@ -3,13 +3,16 @@
 import unittest
 
 from argus_sql.contracts.types import ExecutionOutcome
+from argus_sql.contracts.types import LinkedSchemaContext
 from argus_sql.contracts.types import SQLCandidate
+from argus_sql.contracts.types import ValueMatch
 from argus_sql.linking.intent_canonicalizer import canonicalize_intent
 from argus_sql.sandbox.sqlite_sandbox import compute_result_signature
 from argus_sql.verification.consensus_arbiter import verify_and_rank_candidates
 from argus_sql.verification.exceptions import VerificationError
 from argus_sql.verification.semantic_verifier import audit_candidate_invariants
 from argus_sql.verification.sql_repairer import apply_algebraic_sql_repairs
+from argus_sql.verification.sql_repairer import build_diagnostic_repair_prompt
 
 
 class VerificationAndArbiterTest(unittest.TestCase):
@@ -240,6 +243,126 @@ class VerificationAndArbiterTest(unittest.TestCase):
         fn_rep.sql,
         "SELECT CAST(COALESCE(w.total_cost, 0) AS REAL) / NULLIF(a.attendees, 0) FROM att a",
     )
+
+  def test_empty_set_consensus_immunity_and_range_aware_casing_repair(
+      self,
+  ) -> None:
+    """Single clean repair (1.00) beats 3 empty-set votes (0.54) & fixes casing."""
+    intent = canonicalize_intent(
+        "List product descriptions consumed in September 2013."
+    )
+    empty_sig = compute_result_signature(())
+    good_sig = compute_result_signature((("Diesel",),))
+
+    # 3 distinct initial strategies return 0 rows; 1 LLM repair returns data.
+    cands = (
+        SQLCandidate("SELECT Description FROM tx WHERE Date LIKE '2013-09%'", "decomposed_cot"),
+        SQLCandidate("SELECT Description FROM tx WHERE Date >= '2013-09-01'", "formula_defensive"),
+        SQLCandidate("SELECT Description FROM tx WHERE strftime('%Y-%m', Date) = '2013-09'", "skeleton_minimal"),
+        SQLCandidate("SELECT DISTINCT p.Description FROM tx JOIN yearmonth y ON tx.cid = y.cid JOIN products p ON tx.pid = p.pid WHERE y.Date = '201309'", "argus_llm_repair"),
+    )
+    outs = (
+        ExecutionOutcome(True, (), ("Description",), 0, 1.0, "", empty_sig),
+        ExecutionOutcome(True, (), ("Description",), 0, 1.0, "", empty_sig),
+        ExecutionOutcome(True, (), ("Description",), 0, 1.0, "", empty_sig),
+        ExecutionOutcome(True, (("Diesel",),), ("Description",), 1, 1.2, "", good_sig),
+    )
+    winner, _, clusters = verify_and_rank_candidates(
+        cands, outs, intent, repaired_flags=(False, False, False, True)
+    )
+    self.assertEqual(winner.candidate.strategy, "argus_llm_repair")
+    self.assertEqual(clusters[0].result_signature, good_sig)
+    self.assertEqual(clusters[0].total_score, 1.0)
+    self.assertAlmostEqual(clusters[1].total_score, 0.54)
+
+    # Verify DDL `range:` extraction and exact-word casing repair on ALL_NULL!
+    linked = LinkedSchemaContext(
+        db_id="debit",
+        selected_tables=("gasstations", "tx", "yearmonth"),
+        selected_columns=(),
+        fk_closure_edges=(),
+        bridge_tables_added=(),
+        value_matches=(
+            ValueMatch("gasstations", "Segment", "Discount", "Discount", 1.0),
+        ),
+        ddl_prompt=(
+            "CREATE TABLE tx (\n  Date DATE -- range: '2012-08-23'..'2012-08-26'\n);\n\n"
+            "CREATE TABLE yearmonth (\n  Date TEXT -- range: '201112'..'201311'\n);"
+        ),
+    )
+    null_cand = SQLCandidate(
+        "SELECT SUM(Amount) FROM gasstations WHERE Segment = 'discount' AND Date = '201309'",
+        "cot",
+    )
+    null_out = ExecutionOutcome(
+        True, ((None,),), ("s",), 1, 0.4, "", compute_result_signature(((None,),))
+    )
+    null_issues = audit_candidate_invariants(null_cand, null_out, intent, linked)
+    self.assertEqual(null_issues[0].code, "ALL_NULL_RESULT_ANOMALY")
+    self.assertIn("tx.Date='2012-08-23'..'2012-08-26'", null_issues[0].repair_hint)
+    self.assertIn("yearmonth.Date='201112'..'201311'", null_issues[0].repair_hint)
+
+    # Casing mismatch `'discount'` -> `'Discount'` repairs even when span == val!
+    cased_rep = apply_algebraic_sql_repairs(null_cand, null_issues, linked)
+    self.assertIsNotNone(cased_rep)
+    assert cased_rep is not None
+    self.assertIn("Segment = 'Discount'", cased_rep.sql)
+
+    # PostgreSQL `ILIKE` rewrites to SQLite `LIKE` without touching literals.
+    ilike_cand = SQLCandidate(
+        "SELECT * FROM gasstations WHERE Segment ILIKE '%disc%' AND Note = 'ILIKE'",
+        "cot",
+    )
+    err_out = ExecutionOutcome(False, error_message="near \"ILIKE\": syntax error")
+    err_issues = audit_candidate_invariants(ilike_cand, err_out, intent)
+    ilike_rep = apply_algebraic_sql_repairs(ilike_cand, err_issues)
+    self.assertIsNotNone(ilike_rep)
+    assert ilike_rep is not None
+    self.assertIn("Segment LIKE '%disc%'", ilike_rep.sql)
+    self.assertIn("Note = 'ILIKE'", ilike_rep.sql)
+
+    # Diagnostic repair prompt surfaces deduplicated sibling failed SQLs.
+    prompt = build_diagnostic_repair_prompt(
+        "List products",
+        "",
+        linked.ddl_prompt,
+        cands[0],
+        null_issues,
+        failed_sqls=(cands[0].sql, cands[1].sql, cands[1].sql),
+    )
+    self.assertIn("Other Failed SQL Attempts", prompt)
+    self.assertIn(cands[1].sql, prompt)
+
+    # Exact DB match ('Alameda', 1.0) must NEVER be clobbered by a lower-score
+    # prefix match ('Alameda Unified', 0.86), and `);` inside `--` DDL comments
+    # must not truncate sibling temporal `range:` extraction!
+    prefix_linked = LinkedSchemaContext(
+        db_id="schools",
+        selected_tables=("schools", "satscores"),
+        selected_columns=(),
+        fk_closure_edges=(),
+        bridge_tables_added=(),
+        value_matches=(
+            ValueMatch("schools", "County", "Alameda", "Alameda", 1.0),
+            ValueMatch("satscores", "dname", "Alameda Unified", "Alameda", 0.86),
+        ),
+        ddl_prompt=(
+            'CREATE TABLE schools (\n'
+            '  "Charter (Y/N)" INTEGER, -- (0: N); 1: Y | range: 0..1\n'
+            '  OpenDate DATE -- range: \'1980-01-01\'..\'2017-09-22\'\n'
+            ');'
+        ),
+    )
+    exact_cand = SQLCandidate(
+        "SELECT School FROM schools WHERE County = 'Alameda' AND Note = 'It''s alameda' AND \"Charter (Y/N)\" = 9",
+        "cot",
+    )
+    empty_out = ExecutionOutcome(True, (), ("School",), 0, 0.5, "", empty_sig)
+    p_issues = audit_candidate_invariants(exact_cand, empty_out, intent, prefix_linked)
+    # `OpenDate` range after `);` comment survives and ranks ahead of numeric!
+    self.assertIn("schools.OpenDate='1980-01-01'..'2017-09-22'", p_issues[0].repair_hint)
+    # Exact `'Alameda'` and multi-word `'It''s alameda'` both remain untouched!
+    self.assertIsNone(apply_algebraic_sql_repairs(exact_cand, p_issues, prefix_linked))
 
 
 if __name__ == "__main__":

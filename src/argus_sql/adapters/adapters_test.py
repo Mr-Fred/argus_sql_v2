@@ -299,6 +299,23 @@ class AdaptersModuleTest(unittest.TestCase):
             with mock.patch("subprocess.run", return_value=fake_proc):
               self.assertEqual(resolver.get_bearer_token(), "win-cli-tok")
 
+    # Verify `parse_prompt_ddl` handles quoted keyword tables, spaced columns,
+    # and inline `--` comments containing `);` without truncating columns.
+    from argus_sql.adapters.ddl_prompt_parser import parse_prompt_ddl
+
+    tricky_ddl = (
+        'CREATE TABLE "order" (\n'
+        '  order_id INTEGER PRIMARY KEY, -- (pk); note\n'
+        '  "Academic Year" TEXT -- matched_values: [\'2014-2015\']\n'
+        ');'
+    )
+    parsed = parse_prompt_ddl(tricky_ddl)
+    self.assertIn("order", parsed)
+    self.assertEqual(
+        parsed["order"].columns,
+        (("order_id", "INTEGER", ()), ("Academic Year", "TEXT", ("2014-2015",))),
+    )
+
 
 if __name__ == "__main__":
   unittest.main()

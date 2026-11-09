@@ -170,22 +170,39 @@ class ArgusSQLPipeline:
 
     # Deterministically rewrite SQLite division/NULL traps at 0 LLM token cost.
     if cfg.enable_semantic_verifier and cfg.enable_algebraic_repair:
-      algebraic_repairs: list[SQLCandidate] = []
-      for cand, out in zip(candidates, outcomes, strict=True):
+      algebraic_repairs: list[tuple[int, SQLCandidate]] = []
+      for idx, (cand, out) in enumerate(zip(candidates, outcomes, strict=True)):
         issues = audit_candidate_invariants(cand, out, intent, linked)
         if issues:
           rewritten = apply_algebraic_sql_repairs(cand, issues, linked)
           if rewritten is not None:
-            algebraic_repairs.append(rewritten)
+            algebraic_repairs.append((idx, rewritten))
 
       # Execute all algebraically repaired candidates together in one batch.
       if algebraic_repairs:
         rep_outcomes = self._sandbox.execute_batch(
-            db_path, [c.sql for c in algebraic_repairs]
+            db_path, [c.sql for _, c in algebraic_repairs]
         )
-        candidates.extend(algebraic_repairs)
-        outcomes.extend(rep_outcomes)
-        repaired_flags.extend([True] * len(algebraic_repairs))
+        for (orig_idx, rep_c), rep_o in zip(
+            algebraic_repairs, rep_outcomes, strict=True
+        ):
+          if not rep_o.succeeded:
+            continue
+          still_empty_or_null = rep_o.row_count == 0 or (
+              rep_o.row_count == 1
+              and bool(rep_o.rows)
+              and all(cell is None for cell in rep_o.rows[0])
+          )
+          # Upgrade in-place when both original and rewrite are empty/all-NULL
+          # so Stage 4b gets clean casing without doubling EMPTY_SET votes!
+          if outcomes[orig_idx].succeeded and still_empty_or_null:
+            candidates[orig_idx] = rep_c
+            outcomes[orig_idx] = rep_o
+            repaired_flags[orig_idx] = True
+          else:
+            candidates.append(rep_c)
+            outcomes.append(rep_o)
+            repaired_flags.append(True)
 
     # Stage 4b: Optional LLM Diagnostic Repair only when zero error-free SQL exists.
     # Soft heuristic warnings (e.g., arity estimates) do not burn extra LLM calls.
@@ -219,12 +236,18 @@ class ArgusSQLPipeline:
           cfg.enable_semantic_verifier,
       )
       if primary_issues:
+        other_failed = tuple(
+            c.sql
+            for idx, c in enumerate(candidates)
+            if idx != seed_idx and c.sql.strip()
+        )
         rep_prompt = build_diagnostic_repair_prompt(
             intent.canonical_question,
             task.evidence,
             linked.ddl_prompt,
             seed_cand,
             primary_issues,
+            failed_sqls=other_failed,
         )
         rep_req = LLMCompletionRequest(
             request_id=f"{task.question_id}-argus-llm-rep",
@@ -245,6 +268,20 @@ class ArgusSQLPipeline:
         candidates.append(rep_cand)
         outcomes.append(rep_out)
         repaired_flags.append(True)
+
+        # Harden LLM-repaired SQL with zero-token algebraic dialect rewrites
+        # (e.g., `SELECT DISTINCT` or `CAST(... AS REAL)`) if needed.
+        if cfg.enable_semantic_verifier and cfg.enable_algebraic_repair:
+          rep_issues = audit_candidate_invariants(
+              rep_cand, rep_out, intent, linked
+          )
+          if rep_issues:
+            post_alg = apply_algebraic_sql_repairs(rep_cand, rep_issues, linked)
+            if post_alg is not None:
+              post_out = self._sandbox.execute(db_path, post_alg.sql)
+              candidates.append(post_alg)
+              outcomes.append(post_out)
+              repaired_flags.append(True)
 
     # Stage 4c: Invariant-Weighted Execution Consensus Arbitration.
     # Penalizes integer-truncated or NULL-order-vulnerable clusters automatically.

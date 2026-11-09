@@ -10,11 +10,16 @@ from collections.abc import Sequence
 import dataclasses
 import re
 
-# Extracts `CREATE TABLE <name> ( ... );` blocks from rendered DDL prompts.
+# Extracts `CREATE TABLE <name> ( ... );` blocks without stopping on `);` inside
+# inline `--` SQL comments.
 _CREATE_TABLE_RE = re.compile(
-    r"CREATE\s+TABLE\s+\"?([a-zA-Z0-9_ ]+)\"?\s*\((.*?)\)\s*;",
+    r'CREATE\s+TABLE\s+(?:"((?:""|[^"])+)"|([a-zA-Z0-9_ ]+))\s*\('
+    r"((?:--[^\n]*|'(?:''|[^'])*'|[^;])*?)\)\s*;",
     re.IGNORECASE | re.DOTALL,
 )
+
+# Extracts bare or double-quoted column identifier plus SQLite affinity token.
+_COL_DECL_RE = re.compile(r'^(?:"((?:""|[^"])+)"|(\S+))\s+([a-zA-Z0-9_]+)')
 
 # Extracts `FOREIGN KEY (src_col) REFERENCES dst_tbl(dst_col)` clauses.
 _FK_LINE_RE = re.compile(
@@ -55,13 +60,18 @@ def parse_prompt_ddl(prompt: str) -> dict[str, ParsedPromptTable]:
   tables: dict[str, ParsedPromptTable] = {}
   # Scan every `CREATE TABLE (...)` statement in prompt order.
   for match in _CREATE_TABLE_RE.finditer(prompt):
-    t_name = match.group(1).strip()
-    body = match.group(2)
+    t_name = (
+        match.group(1).replace('""', '"')
+        if match.group(1)
+        else match.group(2).strip()
+    )
+    body = match.group(3)
     cols: list[tuple[str, str, tuple[str, ...]]] = []
     fks: list[tuple[str, str, str]] = []
 
     for raw_line in body.splitlines():
-      line = raw_line.strip().rstrip(",")
+      code_part, _, comment_part = raw_line.partition("--")
+      line = code_part.strip().rstrip(",").strip()
       if not line:
         continue
       # Capture explicit `FOREIGN KEY (...) REFERENCES ...` declarations first.
@@ -73,12 +83,15 @@ def parse_prompt_ddl(prompt: str) -> dict[str, ParsedPromptTable]:
       if line.upper().startswith("PRIMARY KEY"):
         continue
 
-      # Parse column name, SQLite type, and optional `matched_values` literals.
-      code_part, _, comment_part = line.partition("--")
-      tokens = code_part.strip().rstrip(",").split()
-      if len(tokens) >= 2:
-        c_name = tokens[0].strip('"')
-        c_type = tokens[1].upper()
+      # Parse column name (including quoted spaces), type, and `matched_values`.
+      col_m = _COL_DECL_RE.match(line)
+      if col_m is not None:
+        c_name = (
+            col_m.group(1).replace('""', '"')
+            if col_m.group(1)
+            else col_m.group(2).strip('"')
+        )
+        c_type = col_m.group(3).upper()
         matched_vals: list[str] = []
         mv_m = _MATCHED_VAL_RE.search(comment_part)
         if mv_m:

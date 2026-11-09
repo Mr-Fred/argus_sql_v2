@@ -13,8 +13,10 @@ SQLITE_SYSTEM_PROMPT = (
     "Given a CREATE TABLE schema, optional External Evidence formulas, and a "
     "user Question, output a single valid read-only SQLite SELECT statement "
     "inside a ```sql ... ``` code block. Follow External Evidence equations "
-    "and string-slicing rules verbatim, check PRIMARY KEY grain before "
-    "aggregating, and inspect column examples/matched_values for exact formats."
+    "and string-slicing rules verbatim, aggregate with SUM(...) + GROUP BY "
+    "period when querying period totals/extrema over composite PRIMARY KEY "
+    "(entity, period) tables, and check column range:/matched_values/examples "
+    "so WHERE filters never target a sample table whose range excludes the value."
 )
 
 
@@ -44,31 +46,33 @@ def build_strategy_request(
 
   # Tailor reasoning instructions to encourage genuine candidate diversity.
   if strategy_tag == "decomposed_cot":
-    # Emphasizes multi-hop foreign-key path & PRIMARY KEY grain planning.
+    # Emphasizes multi-hop FK paths, range coverage, & composite-PK grain.
     guidance = (
         "Decompose step-by-step: (1) identify required tables, FK join paths, "
-        "and composite PRIMARY KEY table grain (use GROUP BY + SUM when rows "
-        "are per-entity-period), (2) verify exact date/code formats from "
-        "matched_values and examples, (3) translate External Evidence formulas "
+        "and composite PRIMARY KEY (entity, period) grain (use GROUP BY period "
+        "+ SUM(...) for period-level totals/extrema rather than single-row MAX), "
+        "(2) verify column range:, matched_values, and examples—if a target "
+        "date/number falls outside a sample table's range:, join the FK-linked "
+        "table whose range: covers it, (3) translate External Evidence formulas "
         "and SUBSTR rules literally into the final SQLite SELECT query."
     )
   elif strategy_tag == "formula_defensive":
-    # Emphasizes explicit SQLite REAL division, NULL-sort, and DISTINCT guards.
+    # Emphasizes explicit SQLite REAL division, NULL-sort, DISTINCT, & ranges.
     guidance = (
         "Enforce SQLite defensive invariants: promote ratios using "
         "CAST(numerator AS REAL) / NULLIF(denominator, 0), filter NULLs "
         "with IS NOT NULL before ORDER BY ... ASC LIMIT, follow External "
         "Evidence formulas/SUBSTR slices verbatim, use SELECT DISTINCT when "
-        "listing unique entities across 1-to-many joins, and bind exact "
-        "matched_values/examples literals."
+        "listing unique entities across 1-to-many joins, and verify column "
+        "range:/matched_values/examples bounds before filtering."
     )
   elif strategy_tag == "skeleton_minimal":
-    # Emphasizes projection arity discipline and direct evidence translation.
+    # Emphasizes projection arity discipline, range bounds, and table grain.
     guidance = (
         "Draft the minimal relational SQL skeleton (SELECT ... FROM ... JOIN "
-        "... WHERE ...) projecting only the exact columns requested, apply "
-        "External Evidence formulas directly without extra nested CTEs unless "
-        "required, and fill exact column names and literals from the DDL."
+        "... WHERE ...) projecting only the exact columns requested, verify "
+        "column range: bounds and composite PRIMARY KEY grain before choosing "
+        "MAX vs GROUP BY + SUM, and apply External Evidence formulas directly."
     )
   else:
     # Default zero-shot directive keeps prompt overhead minimal for baselines.

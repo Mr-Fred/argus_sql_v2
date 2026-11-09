@@ -17,9 +17,9 @@ As conversational and voice-driven interfaces become a primary way humans intera
 **Argus-SQL** systematically implements, compares, and recombines modular NL2SQL operators into a fast, voice-ready four-stage architecture:
 
 1. **Voice & Intent Canonicalizer (`linking/intent_canonicalizer.py`)**: Strips ASR disfluencies/stutters, normalizes spoken cardinals (`"top five"` -> `top 5`), extracts hyphenated/short lowercase domain codes, and estimates complexity & multi-pair/dual-extrema projection arity.
-2. **Exact Short-Code + 3-Gram Cell Value Index & Implicit/Junction FK Closure (`linking/value_retriever.py`, `linking/schema_graph.py`, `linking/fk_schema_linker.py`)**: Grounds messy string cells and 2–3 character domain codes in sub-millisecond time, hydrates SQLite sample literals and CSV value codebooks, splits compound identifiers (`gasstations` -> `gas`, `station`), and recovers explicit, implicit PK-matched, and M:N junction bridge tables (`98%+` gold column/table recall across `bird_mini_dev`).
+2. **Exact Short-Code + 3-Gram Cell Value Index, `MIN..MAX` Domain Ranges & Implicit/Junction FK Closure (`linking/value_retriever.py`, `linking/schema_graph.py`, `linking/fk_schema_linker.py`, `evaluation/bird_metadata.py`)**: Grounds messy string cells and 2–3 character domain codes in sub-millisecond time, hydrates batched read-only `MIN..MAX` temporal/numeric domain bounds (`range: '2012-08-23'..'2012-08-26'`, `range: 0.0018..1.0`) alongside CSV value codebooks, splits compound identifiers (`gasstations` -> `gas`, `station`), and recovers explicit, implicit PK-matched, and M:N junction bridge tables (`99%+` gold table recall across `bird_mini_dev`).
 3. **Complexity-Gated Diverse Batch Synthesis (`pipelines/argus_pipeline.py`)**: Renders valid composite `PRIMARY KEY (...)` grain DDL, routes simple lookups through a $K=1$ Voice Fast-Path, and dispatches $K=3$ diverse strategies concurrently (`decomposed_cot`, `formula_defensive`, `skeleton_minimal`) for analytical queries.
-4. **7-Invariant Semantic Verifier, Zero-Token Algebraic Repair & Consensus (`verification/`)**: Audits live outcomes in a C-authorizer-locked read-only SQLite sandbox (`sandbox/sqlite_sandbox.py`), deterministically repairs SQLite integer/parenthesized division, `NULL`-first sorts, and 1-to-many `JOIN` fanout duplicates (`SELECT DISTINCT`) in `< 1 ms`, and ranks equivalence clusters via Invariant-Weighted Consensus.
+4. **7-Invariant Semantic Verifier, Range-Guided Repair & Error-Free Consensus (`verification/`)**: Audits live outcomes in a C-authorizer-locked read-only SQLite sandbox (`sandbox/sqlite_sandbox.py`), deterministically repairs SQLite integer/parenthesized division, `NULL`-first sorts, `ILIKE`, exact-word literal casing, and 1-to-many `JOIN` fanout duplicates (`SELECT DISTINCT`) in `< 1 ms`, escalates all-empty/all-`NULL` queries with DDL `range:` bounds + sibling failed SQL traces, and ranks equivalence clusters via Invariant-Weighted Consensus (blocking correlated `0`-row clusters from outvoting clean repairs).
 
 ---
 
@@ -50,11 +50,11 @@ PYTHONPATH=src python3 -m argus_sql.evaluation.cli --mode diagnostic
 
 | System | Simple EX | Mod. EX | Chall. EX | Clean EX (%) | Clean R-VES | Voice EX (%) | Mean Tokens |
 | :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
-| `B0_ZeroShotDDL` | 75.0 | 37.5 | 0.0 | 37.5 | 37.5 | 16.7 | 338 |
-| `B1_DINDecomposed` | 100.0 | 25.0 | 0.0 | 41.7 | 41.7 | 25.0 | 316 |
-| `B2_MACRefiner` | 100.0 | 37.5 | 0.0 | 45.8 | 45.8 | 25.0 | 318 |
-| `B3_CHESSValueConsistency` | 100.0 | 62.5 | 0.0 | 54.2 | 54.2 | 41.7 | 1018 |
-| **`Argus-SQL` (Ours)** | **100.0** | **100.0** | **100.0** | **100.0** | **100.0** | **100.0** | **921** |
+| `B0_ZeroShotDDL` | 75.0 | 37.5 | 0.0 | 37.5 | 37.5 | 16.7 | 375 |
+| `B1_DINDecomposed` | 100.0 | 25.0 | 0.0 | 41.7 | 41.7 | 25.0 | 391 |
+| `B2_MACRefiner` | 100.0 | 37.5 | 0.0 | 45.8 | 45.8 | 25.0 | 392 |
+| `B3_CHESSValueConsistency` | 100.0 | 62.5 | 0.0 | 54.2 | 54.2 | 41.7 | 1175 |
+| **`Argus-SQL` (Ours)** | **100.0** | **100.0** | **100.0** | **100.0** | **100.0** | **100.0** | **1059** |
 
 > Paired two-sided exact McNemar test (`Argus-SQL` vs. `B3_CHESSValueConsistency`, $N = 48$ Clean + Voice queries): $p = 5.96 \times 10^{-8}$.
 

@@ -201,6 +201,97 @@ class EvaluationModuleTest(unittest.TestCase):
           evaluate_prediction(float_task, float_pred, demo_sqlite, sandbox).ex_correct
       )
 
+  def test_sqlite_column_ranges_handle_blank_cells_composite_ym_and_exclusions(
+      self,
+  ) -> None:
+    """Batched MIN..MAX extraction ignores ''/N/A and skips IDs & free text."""
+    import sqlite3
+
+    with tempfile.TemporaryDirectory() as tmp:
+      bird_root = pathlib.Path(tmp)
+      db_dir = bird_root / "dev_databases" / "debit_mini"
+      db_dir.mkdir(parents=True)
+      sqlite_path = db_dir / "debit_mini.sqlite"
+      conn = sqlite3.connect(sqlite_path)
+      try:
+        conn.execute(
+            "CREATE TABLE tx_sample (TransactionID INTEGER PRIMARY KEY, "
+            "ChainID INTEGER, account_to INTEGER, Date DATE, SchoolName TEXT, "
+            "LowGrade TEXT, FreeRate REAL, Latitude REAL)"
+        )
+        conn.execute(
+            "CREATE TABLE yearmonth (CustomerID INTEGER, Date TEXT, "
+            "Consumption REAL, PRIMARY KEY (CustomerID, Date))"
+        )
+        # Include empty string '' in Date and 'N/A' in FreeRate to verify
+        # blank CSV strings and dirty text placeholders never corrupt MIN..MAX!
+        conn.executemany(
+            "INSERT INTO tx_sample VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            [
+                (1, 10, 880011, "", "Alpha Charter", "1", 0.00176, 34.05),
+                (2, 20, 990022, "2012-08-23", "Zeta High", "P", 1.0, 37.77),
+                (3, 30, 770033, "2012-08-26", "Mid School", "9", "N/A", 38.58),
+            ],
+        )
+        conn.executemany(
+            "INSERT INTO yearmonth VALUES (?, ?, ?)",
+            [(1, "201112", 12.5), (1, "201311", 450.25)],
+        )
+        conn.commit()
+      finally:
+        conn.close()
+
+      # Serialize minimal BIRD `dev_tables.json` metadata with composite PKs.
+      tables_json = [{
+          "db_id": "debit_mini",
+          "table_names_original": ["tx_sample", "yearmonth"],
+          "column_names_original": [
+              [-1, "*"],
+              [0, "TransactionID"],
+              [0, "ChainID"],
+              [0, "account_to"],
+              [0, "Date"],
+              [0, "SchoolName"],
+              [0, "LowGrade"],
+              [0, "FreeRate"],
+              [0, "Latitude"],
+              [1, "CustomerID"],
+              [1, "Date"],
+              [1, "Consumption"],
+          ],
+          # Mix `date`, `text`, `integer`, and `real` declarations as in BIRD.
+          "column_types": [
+              "text", "integer", "integer", "integer", "date", "text", "text",
+              "real", "real", "integer", "text", "real",
+          ],
+          # `[9, 10]` mirrors `yearmonth(CustomerID, Date)` composite primary key.
+          "primary_keys": [1, [9, 10]],
+          "foreign_keys": [],
+      }]
+      # Write metadata JSON files to the temporary split directory and load.
+      (bird_root / "dev_tables.json").write_text(
+          json.dumps(tables_json), encoding="utf-8"
+      )
+      (bird_root / "dev.json").write_text("[]", encoding="utf-8")
+
+      # Verify `load_bird_split` hydrates `value_range` across all valid columns.
+      _, schemas, _ = load_bird_split(bird_root)
+      tx_cols = {c.name: c for c in schemas["debit_mini"].tables[0].columns}
+      ym_cols = {c.name: c for c in schemas["debit_mini"].tables[1].columns}
+
+      # Temporal & measure ranges extracted accurately despite '' and 'N/A'.
+      self.assertEqual(tx_cols["Date"].value_range, ("2012-08-23", "2012-08-26"))
+      self.assertEqual(tx_cols["FreeRate"].value_range, ("0.0018", "1.0"))
+      self.assertEqual(ym_cols["Date"].value_range, ("201112", "201311"))
+      self.assertEqual(ym_cols["Consumption"].value_range, ("12.5", "450.25"))
+
+      # Surrogate IDs, account_to, coordinates, and free-text/grade strings stay None.
+      for excluded in (
+          "TransactionID", "ChainID", "account_to", "SchoolName", "LowGrade", "Latitude"
+      ):
+        self.assertIsNone(tx_cols[excluded].value_range, msg=excluded)
+      self.assertIsNone(ym_cols["CustomerID"].value_range)
+
   def test_bird_loader_auto_resolves_mini_dev_json_and_jsonl(self) -> None:
     """`load_bird_split` auto-discovers `mini_dev_sqlite.jsonl` and lowercase sql."""
     with tempfile.TemporaryDirectory() as tmp:

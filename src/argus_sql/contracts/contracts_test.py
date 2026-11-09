@@ -108,6 +108,51 @@ class ContractsAndDDLTest(unittest.TestCase):
     finally:
       conn.close()
 
+  def test_renders_temporal_and_numeric_ranges_without_redundant_examples(
+      self,
+  ) -> None:
+    """Temporal/numeric `value_range`s render compactly and execute in SQLite."""
+    import sqlite3
+
+    tx = TableSchema(
+        name="transactions_sample",
+        columns=(
+            ColumnSchema(
+                "tx_id",
+                "INTEGER",
+                is_primary_key=True,
+                value_examples=("1", "2"),
+            ),
+            ColumnSchema(
+                "Date",
+                "DATE",
+                description="Sample date",
+                value_examples=("2012-08-24", "2012-08-25"),
+                value_range=("2012-08-23", "2012-08-26"),
+            ),
+            ColumnSchema(
+                "pct_free",
+                "REAL",
+                value_examples=("0.25", "0.5"),
+                value_range=("0.0018", "1.0"),
+            ),
+        ),
+    )
+    ddl = render_schema_ddl(DatabaseSchema(db_id="sample_db", tables=(tx,)))
+    # Quoted temporal range and unquoted numeric range appear; redundant
+    # `examples:` on ranged columns are omitted while PK `examples:` stay.
+    self.assertIn("range: '2012-08-23'..'2012-08-26'", ddl)
+    self.assertIn("range: 0.0018..1.0", ddl)
+    self.assertIn("examples: ['1', '2']", ddl)
+    self.assertNotIn("2012-08-24", ddl)
+
+    # Multi-column commented DDL must parse cleanly in SQLite `executescript`.
+    conn = sqlite3.connect(":memory:")
+    try:
+      conn.executescript(ddl)
+    finally:
+      conn.close()
+
 
 if __name__ == "__main__":
   unittest.main()

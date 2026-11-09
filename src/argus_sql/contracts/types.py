@@ -30,6 +30,7 @@ class ColumnSchema:
     is_primary_key: True when the column participates in the primary key.
     description: Human-readable column meaning from metadata CSVs if available.
     value_examples: Representative sample cell strings for prompt grounding.
+    value_range: Optional `(min_value, max_value)` domain bounds from SQLite.
   """
 
   name: str
@@ -37,6 +38,7 @@ class ColumnSchema:
   is_primary_key: bool = False
   description: str = ""
   value_examples: tuple[str, ...] = ()
+  value_range: tuple[str, str] | None = None
 
 
 # Represents a directed foreign-key join constraint between two tables.

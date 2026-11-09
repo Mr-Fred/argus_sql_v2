@@ -37,6 +37,92 @@ _DEDUP_OR_AGG_SQL_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Extracts `CREATE TABLE <name> ( ... );` blocks without stopping on `);` inside
+# inline `--` CSV descriptions (which convert `·` bullets into `; `).
+_DDL_TABLE_BLOCK_RE = re.compile(
+    r'CREATE\s+TABLE\s+(?:"((?:""|[^"])+)"|([a-zA-Z0-9_]+))\s*\('
+    r"((?:--[^\n]*|'(?:''|[^'])*'|[^;])*?)\)\s*;",
+    re.IGNORECASE | re.DOTALL,
+)
+
+# Extracts bare or double-quoted column identifier at the start of a DDL line.
+_DDL_COL_HEAD_RE = re.compile(r'^(?:"((?:""|[^"])+)"|([a-zA-Z0-9_]+))\s+')
+
+
+def _extract_ddl_column_ranges(
+    ddl_prompt: str,
+    sql_text: str,
+    max_items: int = 8,
+) -> list[str]:
+  """Extracts prioritized `table.col=lo..hi` domain bounds from `ddl_prompt`."""
+  if "range:" not in ddl_prompt:
+    return []
+  sql_low = sql_text.lower()
+  scored_ranges: list[tuple[tuple[int, int], str]] = []
+  ordinal = 0
+
+  # Scan prompt DDL purely in-memory so `verification/` performs zero I/O.
+  for match in _DDL_TABLE_BLOCK_RE.finditer(ddl_prompt):
+    t_name = (
+        match.group(1).replace('""', '"') if match.group(1) else match.group(2)
+    )
+    for raw_line in match.group(3).splitlines():
+      if "range:" not in raw_line or "--" not in raw_line:
+        continue
+      code_part, _, comment_part = raw_line.partition("--")
+      col_m = _DDL_COL_HEAD_RE.match(code_part.strip())
+      rng_m = re.search(r"\brange:\s*([^\n|]+)", comment_part)
+      if col_m is None or rng_m is None:
+        continue
+      c_name = (
+          col_m.group(1).replace('""', '"') if col_m.group(1) else col_m.group(2)
+      )
+      c_low = c_name.lower()
+      rng_val = rng_m.group(1).strip()
+      in_sql = c_low in sql_low
+      is_temporal = ("'" in rng_val) or any(
+          k in c_low for k in ("date", "year", "yr", "season", "month", "time")
+      )
+      # Rank: (0) SQL temporal, (1) sibling temporal, (2) SQL numeric, (3) rest.
+      prio = 0 if (in_sql and is_temporal) else (1 if is_temporal else (2 if in_sql else 3))
+      scored_ranges.append(((prio, ordinal), f"{t_name}.{c_name}={rng_val}"))
+      ordinal += 1
+
+  scored_ranges.sort(key=lambda item: item[0])
+  return [entry for _, entry in scored_ranges[:max_items]]
+
+
+def _build_filter_recovery_hint(
+    sql_text: str,
+    linked_schema: LinkedSchemaContext | None,
+) -> str:
+  """Constructs grounded-value, domain-range, and code-padding repair hints."""
+  parts: list[str] = []
+  if linked_schema is not None:
+    if linked_schema.value_matches:
+      seen_vals: list[str] = []
+      for vm in linked_schema.value_matches:
+        lit_spec = f"{vm.table_name}.{vm.column_name} = {vm.matched_value!r}"
+        if lit_spec not in seen_vals:
+          seen_vals.append(lit_spec)
+        if len(seen_vals) >= 3:
+          break
+      parts.append(f"Grounded literals: {', '.join(seen_vals)}.")
+
+    ranges = _extract_ddl_column_ranges(linked_schema.ddl_prompt, sql_text)
+    if ranges:
+      parts.append(
+          f"DDL column bounds [{'; '.join(ranges)}]: if a date/numeric filter "
+          "falls outside a sample table's range, join the FK-related table "
+          "whose column range covers the target value and match its format."
+      )
+
+  parts.append(
+      "Verify exact string casing and zero-padded TEXT codes "
+      "(or CAST(col AS INTEGER) on numeric code comparisons)."
+  )
+  return " " + " ".join(parts)
+
 
 def audit_candidate_invariants(
     candidate: SQLCandidate,
@@ -74,23 +160,19 @@ def audit_candidate_invariants(
     )
     return tuple(issues)
 
-  # 2. Empty result warning when grounded literals exist in the database.
+  sql_text = candidate.sql
+  filter_hint = _build_filter_recovery_hint(sql_text, linked_schema)
+
+  # 2. Empty result error enriched with grounded literals and DDL range bounds.
   if outcome.row_count == 0:
-    val_hint = ""
-    if linked_schema and linked_schema.value_matches:
-      top_v = linked_schema.value_matches[0]
-      val_hint = (
-          f" Use grounded literal {top_v.table_name}.{top_v.column_name} = "
-          f"{top_v.matched_value!r}."
-      )
     issues.append(
         InvariantIssue(
             code="EMPTY_RESULT_ANOMALY",
             severity="ERROR",
             message="Query executed without error but returned 0 rows.",
             repair_hint=(
-                "Relax over-restrictive WHERE predicates or check exact string "
-                f"literal casing.{val_hint}"
+                "Relax over-restrictive WHERE predicates or switch to the "
+                f"table covering the target filter.{filter_hint}"
             ),
         )
     )
@@ -98,7 +180,6 @@ def audit_candidate_invariants(
   if not enable_semantic_checks:
     return tuple(issues)
 
-  sql_text = candidate.sql
   # Mask string literals for ORDER BY inspection, and mask ALL quoted tokens
   # (`'...'`, `"..."`, `` `...` ``, `[...]`) for division checks so slashes
   # inside `'2023/01'` or `` `Charter School (Y/N)` `` never false-alarm!
@@ -109,7 +190,8 @@ def audit_candidate_invariants(
       sql_text,
   )
 
-  # 3. Detect all-NULL scalar aggregation results (e.g., `[(None,)]`).
+  # 3. Detect all-NULL scalar aggregation results (e.g., `[(None,)]` when
+  # `SUM`/`MAX`/`AVG` filters an out-of-range table or ungrounded literal).
   if outcome.row_count == 1 and outcome.rows and all(
       cell is None for cell in outcome.rows[0]
   ):
@@ -119,8 +201,8 @@ def audit_candidate_invariants(
             severity="ERROR",
             message="Query returned a single row containing only NULL values.",
             repair_hint=(
-                "Check WHERE filter literals and guard division by zero with "
-                "NULLIF(denominator, 0)."
+                "Guard division by zero with NULLIF(denominator, 0) and fix "
+                f"empty-matching WHERE predicates.{filter_hint}"
             ),
         )
     )

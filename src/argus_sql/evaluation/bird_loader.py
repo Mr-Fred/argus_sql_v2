@@ -17,7 +17,9 @@ from argus_sql.contracts.types import QueryDifficulty
 from argus_sql.contracts.types import TableSchema
 from argus_sql.evaluation.bird_metadata import load_column_descriptions
 from argus_sql.evaluation.bird_metadata import load_sqlite_column_examples
+from argus_sql.evaluation.bird_metadata import load_sqlite_column_ranges
 from argus_sql.evaluation.exceptions import BenchmarkDatasetError
+from argus_sql.linking.schema_graph import resolve_effective_foreign_keys
 
 # Digits mapped to spoken ASR words during Voice-BIRD utterance perturbation.
 _DIGIT_TO_WORD: dict[str, str] = {
@@ -232,6 +234,21 @@ def load_bird_split(
         raw_col_names_by_tbl[t_names[t_idx]].append(str(pair[1]))
     col_examples = load_sqlite_column_examples(sqlite_file, raw_col_names_by_tbl)
 
+    # Reconstruct directed ForeignKeyEdge objects from column index pairs first
+    # so range extraction excludes surrogate foreign-key integer columns.
+    fks: list[ForeignKeyEdge] = []
+    for fk_pair in entry.get("foreign_keys", []):
+      src_i, dst_i = int(fk_pair[0]), int(fk_pair[1])
+      src_t, src_c = int(c_entries[src_i][0]), str(c_entries[src_i][1])  # type: ignore[arg-type]
+      dst_t, dst_c = int(c_entries[dst_i][0]), str(c_entries[dst_i][1])  # type: ignore[arg-type]
+      fks.append(
+          ForeignKeyEdge(t_names[src_t], src_c, t_names[dst_t], dst_c)
+      )
+    fk_col_set = frozenset(
+        {(e.source_table.lower(), e.source_column.lower()) for e in fks}
+        | {(e.target_table.lower(), e.target_column.lower()) for e in fks}
+    )
+
     # Flatten both scalar PK indices and composite `[col_a, col_b]` PK lists.
     pk_flat: set[int] = set()
     for pk_item in entry.get("primary_keys", []):
@@ -261,19 +278,37 @@ def load_bird_split(
           )
       )
 
-    # Reconstruct directed ForeignKeyEdge objects from column index pairs.
-    fks: list[ForeignKeyEdge] = []
-    for fk_pair in entry.get("foreign_keys", []):
-      src_i, dst_i = int(fk_pair[0]), int(fk_pair[1])
-      src_t, src_c = int(c_entries[src_i][0]), str(c_entries[src_i][1])  # type: ignore[arg-type]
-      dst_t, dst_c = int(c_entries[dst_i][0]), str(c_entries[dst_i][1])  # type: ignore[arg-type]
-      fks.append(
-          ForeignKeyEdge(t_names[src_t], src_c, t_names[dst_t], dst_c)
-      )
-
-    tables = tuple(
+    # Hydrate batched MIN..MAX temporal and numeric bounds once per database,
+    # excluding both declared and implicit PK-matched foreign-key columns.
+    prelim_tables = tuple(
         TableSchema(name=t_name, columns=tuple(cols_per_table[idx]))
         for idx, t_name in enumerate(t_names)
+    )
+    eff_fks = resolve_effective_foreign_keys(
+        DatabaseSchema(db_id, prelim_tables, tuple(fks)),
+        enable_implicit=True,
+    )
+    eff_fk_cols = fk_col_set | frozenset(
+        {(e.source_table.lower(), e.source_column.lower()) for e in eff_fks}
+        | {(e.target_table.lower(), e.target_column.lower()) for e in eff_fks}
+    )
+    col_ranges = load_sqlite_column_ranges(sqlite_file, prelim_tables, eff_fk_cols)
+    tables = tuple(
+        TableSchema(
+            name=tbl.name,
+            columns=tuple(
+                ColumnSchema(
+                    name=c.name,
+                    data_type=c.data_type,
+                    is_primary_key=c.is_primary_key,
+                    description=c.description,
+                    value_examples=c.value_examples,
+                    value_range=col_ranges.get((tbl.name.lower(), c.name.lower())),
+                )
+                for c in tbl.columns
+            ),
+        )
+        for tbl in prelim_tables
     )
     schemas[db_id] = DatabaseSchema(db_id, tables, tuple(fks))
 

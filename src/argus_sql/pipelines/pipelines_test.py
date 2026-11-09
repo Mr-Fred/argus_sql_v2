@@ -146,6 +146,169 @@ class ComparativePipelinesTest(unittest.TestCase):
       # Argus-SQL must recover `schools` bridge, `'California'`, and `0.4`!
       self.assertEqual(argus_out.result_signature, gold_out.result_signature)
 
+  def test_argus_recovers_from_all_empty_sample_table_via_range_and_repair(
+      self,
+  ) -> None:
+    """Single clean repair defeats 3 empty-set votes on narrow sample tables."""
+    from collections.abc import Sequence
+    from argus_sql.adapters.types import LLMCompletionRequest
+    from argus_sql.adapters.types import LLMCompletionResponse
+
+    class _RangeAwareMockLLM:
+      """Simulates K=3 out-of-range sample-table misses followed by repair."""
+
+      def batch_complete(
+          self, requests: Sequence[LLMCompletionRequest]
+      ) -> tuple[LLMCompletionResponse, ...]:
+        """Emits 0-row sample predicates initially, then repairs via range.
+
+        Args:
+          requests: Batch of initial synthesis or diagnostic repair requests.
+
+        Returns:
+          Tuple of mock SQL completion responses aligned 1-to-1 with requests.
+        """
+        outs: list[LLMCompletionResponse] = []
+        for req in requests:
+          if req.strategy_tag == "repair":
+            # Verify repair prompt carries both range bounds and failed SQLs!
+            assert "tx_sample.Date='2012-08-23'..'2012-08-26'" in req.user_prompt
+            assert "yearmonth.Date='201112'..'201311'" in req.user_prompt
+            assert "Other Failed SQL Attempts" in req.user_prompt
+            # Omit DISTINCT so post-repair algebraic fanout dedup is exercised!
+            sql = (
+                "SELECT p.Description FROM tx_sample t "
+                "JOIN yearmonth y ON t.CustomerID = y.CustomerID "
+                "JOIN products p ON t.ProductID = p.ProductID "
+                "WHERE y.Date = '201309'"
+            )
+          elif req.strategy_tag == "skeleton_minimal":
+            # Include mis-cased `'diesel'` on out-of-range `tx_sample` so Stage
+            # 4a rewrites all 3 candidates without doubling EMPTY_SET votes!
+            sql = (
+                "SELECT DISTINCT p.Description FROM products p "
+                "JOIN tx_sample t ON p.ProductID = t.ProductID "
+                "WHERE p.Description != 'natural 95' "
+                "AND strftime('%Y-%m', t.Date) = '2013-09'"
+            )
+          else:
+            # Simulate `LIKE '2013-09%'` + mis-cased literal on narrow sample.
+            sql = (
+                "SELECT DISTINCT p.Description FROM products p "
+                "JOIN tx_sample t ON p.ProductID = t.ProductID "
+                "WHERE p.Description != 'natural 95' AND t.Date LIKE '2013-09%'"
+            )
+          outs.append(
+              LLMCompletionResponse(req.request_id, sql, sql, 120, 30)
+          )
+        return tuple(outs)
+
+    # Materialize clean-room SQLite fixture modeling narrow sample vs yearmonth.
+    with tempfile.TemporaryDirectory() as tmp:
+      root = pathlib.Path(tmp)
+      db_file = root / "debit_sample.sqlite"
+      conn = sqlite3.connect(db_file)
+      try:
+        # Create `products`, narrow `tx_sample`, and full-range `yearmonth`.
+        conn.executescript("""
+          CREATE TABLE products (ProductID INTEGER PRIMARY KEY, Description TEXT);
+          CREATE TABLE tx_sample (
+            TxID INTEGER PRIMARY KEY, CustomerID INTEGER,
+            ProductID INTEGER, Date DATE
+          );
+          CREATE TABLE yearmonth (
+            CustomerID INTEGER, Date TEXT, Consumption REAL,
+            PRIMARY KEY (CustomerID, Date)
+          );
+        """)
+        # Populate two product labels to verify non-empty entity projection.
+        conn.executemany(
+            "INSERT INTO products VALUES (?, ?)",
+            [(1, "Diesel"), (2, "Natural 95")],
+        )
+        # `tx_sample` covers only 2012-08-23..2012-08-26 with 6 fanout rows.
+        conn.executemany(
+            "INSERT INTO tx_sample VALUES (?, ?, ?, ?)",
+            [
+                (10 + i, 100, 1 if i < 4 else 2, f"2012-08-2{3 + (i % 4)}")
+                for i in range(6)
+            ],
+        )
+        # `yearmonth` spans 201112..201311 and covers target month `'201309'`.
+        conn.executemany(
+            "INSERT INTO yearmonth VALUES (?, ?, ?)",
+            [(100, "201112", 50.0), (100, "201309", 180.0), (100, "201311", 90.0)],
+        )
+        conn.commit()
+      finally:
+        conn.close()
+
+      # Declare typed DatabaseSchema carrying hydrated `value_range` metadata.
+      schema = DatabaseSchema(
+          db_id="debit_sample",
+          tables=(
+              TableSchema(
+                  "products",
+                  (
+                      ColumnSchema("ProductID", "INTEGER", is_primary_key=True),
+                      ColumnSchema("Description", "TEXT"),
+                  ),
+              ),
+              # Sample table Date range reveals it lacks 2013 records.
+              TableSchema(
+                  "tx_sample",
+                  (
+                      ColumnSchema("TxID", "INTEGER", is_primary_key=True),
+                      ColumnSchema("CustomerID", "INTEGER"),
+                      ColumnSchema("ProductID", "INTEGER"),
+                      ColumnSchema(
+                          "Date", "DATE", value_range=("2012-08-23", "2012-08-26")
+                      ),
+                  ),
+              ),
+              # Composite-PK `yearmonth` Date range covers `'201112'..'201311'`.
+              TableSchema(
+                  "yearmonth",
+                  (
+                      ColumnSchema("CustomerID", "INTEGER", is_primary_key=True),
+                      ColumnSchema(
+                          "Date",
+                          "TEXT",
+                          is_primary_key=True,
+                          value_range=("201112", "201311"),
+                      ),
+                      ColumnSchema(
+                          "Consumption", "REAL", value_range=("50.0", "180.0")
+                      ),
+                  ),
+              ),
+          ),
+          # Connect `tx_sample` to both `products` and `yearmonth` via FKs.
+          foreign_keys=(
+              ForeignKeyEdge("tx_sample", "ProductID", "products", "ProductID"),
+              ForeignKeyEdge("tx_sample", "CustomerID", "yearmonth", "CustomerID"),
+          ),
+      )
+
+      # Execute full Argus-SQL pipeline over the sample-range trap task.
+      sandbox = SQLiteReadOnlySandbox(SandboxPolicy(allowed_db_root=root))
+      task = NLQueryTask(
+          question_id="1500",
+          db_id="debit_sample",
+          question="Please list the product descriptions (such as Natural 95) consumed in September 2013.",
+          evidence="September 2013 refers to 201309.",
+          difficulty=QueryDifficulty.MODERATE,
+      )
+      argus = ArgusSQLPipeline(_RangeAwareMockLLM(), sandbox)
+      pred = argus.predict(task, schema, db_file)
+
+      # Winning SQL must be the non-empty repaired query (with DISTINCT hardened),
+      # defeating the 3 correlated 0-row sample-table queries!
+      self.assertIn("yearmonth", pred.final_sql)
+      self.assertTrue(pred.final_sql.startswith("SELECT DISTINCT"))
+      win_out = sandbox.execute(db_file, pred.final_sql)
+      self.assertEqual(set(win_out.rows), {("Diesel",), ("Natural 95",)})
+
 
 if __name__ == "__main__":
   unittest.main()

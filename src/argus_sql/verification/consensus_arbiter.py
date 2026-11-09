@@ -125,14 +125,21 @@ def verify_and_rank_candidates(
   if not cluster_members:
     return (verified_list[0], tuple(verified_list), ())
 
-  # 3. Score each execution equivalence cluster with diversity bonus.
+  # 3. Score each execution equivalence cluster with error-free diversity bonus.
+  # Restricting diversity credit to candidates without ERROR invariants prevents
+  # correlated 0-row (`EMPTY_RESULT_ANOMALY`) clusters from outvoting repairs.
   clusters: list[ConsensusCluster] = []
   for sig, indices in cluster_members.items():
     weight_sum = sum(verified_list[i].consensus_weight for i in indices)
     strategies = tuple(
         sorted({verified_list[i].candidate.strategy for i in indices})
     )
-    diversity = cfg.strategy_diversity_bonus * max(0, len(strategies) - 1)
+    clean_strategies = {
+        verified_list[i].candidate.strategy
+        for i in indices
+        if not any(iss.severity == "ERROR" for iss in verified_list[i].issues)
+    }
+    diversity = cfg.strategy_diversity_bonus * max(0, len(clean_strategies) - 1)
     clusters.append(
         ConsensusCluster(
             result_signature=sig,
