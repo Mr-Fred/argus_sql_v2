@@ -236,6 +236,119 @@ class LinkingModuleTest(unittest.TestCase):
     kept_cols = dict(linked_lab.selected_columns)["Laboratory"]
     self.assertEqual(len(kept_cols), 44)
 
+  def test_iteration4_asr_casing_followup_arity_and_hierarchy_grounding(
+      self,
+  ) -> None:
+    """Voice ASR casing, `? Show`/`Rank` arity, and County-over-City grounding."""
+    from argus_sql.linking.types import ValueIndexEntry
+
+    # 1. Lowercase ASR utterances align casing/punctuation verbatim with Clean.
+    # Verifies alphanumeric bond ID `TR004_8_9` and terminal `?` restoration.
+    ev_bond = "TR004_8_9 bond atoms refers to bond_id = 'TR004_8_9';"
+    v_bond = canonicalize_intent(
+        "uh hey can you please tell me what elements are you know in the tr004_8_9 bond atoms",
+        ev_bond,
+    )
+    self.assertEqual(
+        v_bond.canonical_question,
+        "What elements are in the TR004_8_9 bond atoms?",
+    )
+    self.assertIn("TR004_8_9", v_bond.entities)
+
+    # Verifies `DC` + `Marvel Comics` casing, `? Find`, and strict 1-col formula.
+    ev_hero = (
+        "DC refers to publisher_name = 'DC Comics'; "
+        "Marvel Comics refers to publisher_name = 'Marvel Comics'; "
+        "calculation = SUBTRACT(SUM(publisher_name = 'Marvel Comics'), "
+        "SUM(publisher_name = 'DC Comics'))"
+    )
+    v_hero = canonicalize_intent(
+        "uh hey can you please tell me between dc and you know marvel comics, "
+        "which publisher has published more superheroes? find the difference "
+        "in the number of superheroes they have published",
+        ev_hero,
+    )
+    self.assertEqual(
+        v_hero.canonical_question,
+        "Between DC and Marvel Comics, which publisher has published more "
+        "superheroes? Find the difference in the number of superheroes they "
+        "have published.",
+    )
+    self.assertEqual(v_hero.expected_projection_arity, 1)
+    self.assertTrue(v_hero.strict_single_column)
+
+    # 2. `? Indicate ...` / `? Show ...` follow-up sentences & `Rank X by Y`.
+    # Follow-up `? Indicate` requests a 2nd column, disabling `strict_single_column`.
+    ev_pct = (
+        "published by Marvel Comics refers to publisher_name = 'Marvel Comics'; "
+        "calculation = MULTIPLY(DIVIDE(SUM(alignment = 'Bad'), count(id)), 100)"
+    )
+    v_pct = canonicalize_intent(
+        "what is the percentage of bad superheroes? indicate how many of the "
+        "said superheroes were published by marvel comics",
+        ev_pct,
+    )
+    self.assertEqual(v_pct.expected_projection_arity, 2)
+    self.assertFalse(v_pct.strict_single_column)
+
+    # Follow-up `? Show` and imperative `Rank ... by ...` set arity 2 and 3.
+    show_intent = canonicalize_intent(
+        "Who was the player that got the lap time of 0:01:27? "
+        "Show his introduction website."
+    )
+    self.assertEqual(show_intent.expected_projection_arity, 2)
+    rank_intent = canonicalize_intent(
+        "Rank heroes published by Marvel Comics by their height in descending order."
+    )
+    self.assertEqual(rank_intent.expected_projection_arity, 3)
+
+    # 3. Hierarchy cardinality disambiguation (`County` 58 vs `City`/`MailCity` 500)
+    #    and parenthetical column-qualifier (`K-12`) suppression.
+    geo_schema = DatabaseSchema(
+        "schools_geo",
+        (
+            TableSchema(
+                "schools",
+                (
+                    ColumnSchema("CDSCode", "TEXT", is_primary_key=True),
+                    ColumnSchema("County", "TEXT"),
+                    ColumnSchema("City", "TEXT"),
+                    ColumnSchema("MailCity", "TEXT"),
+                    ColumnSchema("GSserved", "TEXT"),
+                    ColumnSchema("Enrollment (K-12)", "INTEGER"),
+                ),
+            ),
+        ),
+    )
+    _, quals = ("schools",), ("k-12",)
+    del _
+    entries = [
+        ValueIndexEntry("schools", "County", "Fresno", "fresno", frozenset({"  f", "fre"}), 58),
+        ValueIndexEntry("schools", "City", "Fresno", "fresno", frozenset({"  f", "fre"}), 500),
+        ValueIndexEntry("schools", "MailCity", "Fresno", "fresno", frozenset({"  f", "fre"}), 500),
+        ValueIndexEntry("schools", "City", "Hayward", "hayward", frozenset({"  h", "hay"}), 500),
+        ValueIndexEntry("schools", "GSserved", "K-12", "k-12", frozenset({"  k", "k-1"}), 80),
+    ]
+    ret = CellValueRetriever(
+        entries,
+        schema_tokens=frozenset({"schools", "school", "county", "city", "enrollment"}),
+        schema_qualifiers=frozenset(quals),
+    )
+    # Ambiguous `'Fresno schools'` grounds `County` while suppressing `City`/`MailCity`.
+    fresno_vms = ret.retrieve(canonicalize_intent("Average test takers from Fresno schools?"))
+    self.assertEqual([(m.column_name, m.matched_value) for m in fresno_vms], [("County", "Fresno")])
+    # Explicit `'Fresno city'` retains `City`, and city-only `'Hayward'` grounds `City`.
+    city_vms = ret.retrieve(canonicalize_intent("Average test takers in Fresno city?"))
+    self.assertIn(("City", "Fresno"), [(m.column_name, m.matched_value) for m in city_vms])
+    hayward_vms = ret.retrieve(canonicalize_intent("How many schools are in Hayward?"))
+    self.assertEqual([(m.column_name, m.matched_value) for m in hayward_vms], [("City", "Hayward")])
+    # Unquoted `'K-12'` column qualifier is suppressed on `Enrollment (K-12)` queries.
+    k12_vms = ret.retrieve(
+        canonicalize_intent("Give names of schools with free meals in K-12 > 0.1")
+    )
+    self.assertEqual(k12_vms, ())
+    del geo_schema
+
 
 if __name__ == "__main__":
   unittest.main()

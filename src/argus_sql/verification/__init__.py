@@ -3,6 +3,9 @@
 # Re-export consensus arbiter and candidate weighting helper.
 from argus_sql.verification.consensus_arbiter import compute_candidate_weight
 from argus_sql.verification.consensus_arbiter import verify_and_rank_candidates
+# Re-export temporal and window-rank SQLite dialect invariant checks.
+from argus_sql.verification.dialect_invariants import check_missing_window_rank
+from argus_sql.verification.dialect_invariants import check_timestamp_bare_date_comparison
 # Re-export verification domain exception.
 from argus_sql.verification.exceptions import VerificationError
 # Re-export semantic and SQLite dialect invariant verifier.
@@ -22,6 +25,8 @@ __all__ = [
     "apply_algebraic_sql_repairs",
     "audit_candidate_invariants",
     "build_diagnostic_repair_prompt",
+    "check_missing_window_rank",
+    "check_timestamp_bare_date_comparison",
     "compute_candidate_weight",
     "verify_and_rank_candidates",
 ]

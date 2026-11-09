@@ -14,6 +14,7 @@ class ValueIndexEntry:
     raw_value: Exact string value stored in SQLite.
     normalized_value: Lowercased whitespace-collapsed string for comparison.
     trigrams: Frozenset of padded character 3-grams for Jaccard retrieval.
+    column_cardinality: Distinct non-null cell count observed on this column.
   """
 
   table_name: str
@@ -21,6 +22,7 @@ class ValueIndexEntry:
   raw_value: str
   normalized_value: str
   trigrams: frozenset[str]
+  column_cardinality: int = 0
 
 
 # Breakdown of lexical, evidence, and cell-value relevance per column.

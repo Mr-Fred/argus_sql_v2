@@ -153,6 +153,30 @@ class ContractsAndDDLTest(unittest.TestCase):
     finally:
       conn.close()
 
+  def test_retains_distinct_examples_when_description_is_empty(self) -> None:
+    """Undocumented columns retain distinct `examples:` next to `matched_values:`."""
+    # Omit column description on `City` to exercise fallback example retention.
+    tbl = TableSchema(
+        name="schools",
+        columns=(
+            ColumnSchema("id", "INTEGER", is_primary_key=True),
+            ColumnSchema(
+                "City",
+                "TEXT",
+                description="",
+                value_examples=("Hayward", "Newark"),
+            ),
+        ),
+    )
+    # Ground `'Fresno'` while keeping distinct `'Hayward'`, `'Newark'` examples.
+    vm = ValueMatch("schools", "City", "Fresno", "Fresno", 1.0)
+    ddl = render_schema_ddl(
+        DatabaseSchema(db_id="geo", tables=(tbl,)), value_matches=(vm,)
+    )
+    # Both grounded literal and distinct sample domain cities appear inline.
+    self.assertIn("matched_values: ['Fresno']", ddl)
+    self.assertIn("examples: ['Hayward', 'Newark']", ddl)
+
 
 if __name__ == "__main__":
   unittest.main()

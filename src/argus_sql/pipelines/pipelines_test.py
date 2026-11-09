@@ -488,6 +488,131 @@ class ComparativePipelinesTest(unittest.TestCase):
       p_pct = argus.predict(t_pct, schema, db_file)
       self.assertEqual(sandbox.execute(db_file, p_pct.final_sql).rows, ((25.0,),))
 
+  def test_argus_repairs_timestamp_bare_date_zero_token_and_missing_window_rank(
+      self,
+  ) -> None:
+    """Pipeline repairs bare DATETIME filters (0 tok) & missing RANK() OVER."""
+    from collections.abc import Sequence
+    from argus_sql.adapters.types import LLMCompletionRequest
+    from argus_sql.adapters.types import LLMCompletionResponse
+
+    class _Iter4TrapMockLLM:
+      """Emits bare DATETIME comparisons and un-windowed ORDER BY rankings."""
+
+      def batch_complete(
+          self, requests: Sequence[LLMCompletionRequest]
+      ) -> tuple[LLMCompletionResponse, ...]:
+        """Returns trap SQL on initial K=3 passes and window SQL on Stage 4b.
+
+        Args:
+          requests: Batch of synthesis or Stage 4b repair requests.
+
+        Returns:
+          Tuple of mock SQL completion responses aligned 1-to-1 with requests.
+        """
+        outs: list[LLMCompletionResponse] = []
+        for req in requests:
+          if "last accessed" in req.user_prompt.lower():
+            # All 3 strategies copy bare `LastAccessDate > '2014-09-01'` from
+            # Evidence, falsely counting same-day `'2014-09-01 14:23:10'` rows!
+            sql = "SELECT COUNT(Id) FROM users WHERE LastAccessDate > '2014-09-01'"
+          elif req.strategy_tag == "repair":
+            # Stage 4b repair triggered by `MISSING_WINDOW_RANK`.
+            assert "MISSING_WINDOW_RANK" in req.user_prompt
+            sql = (
+                "SELECT name, height_cm, RANK() OVER (ORDER BY height_cm DESC) "
+                "FROM heroes ORDER BY height_cm DESC"
+            )
+          else:
+            # Initial K=3 strategies omit `RANK() OVER (...)`.
+            sql = "SELECT name, height_cm FROM heroes ORDER BY height_cm DESC"
+          outs.append(LLMCompletionResponse(req.request_id, sql, sql, 70, 20))
+        return tuple(outs)
+
+    with tempfile.TemporaryDirectory() as tmp:
+      root = pathlib.Path(tmp)
+      db_file = root / "iter4_traps.sqlite"
+      conn = sqlite3.connect(db_file)
+      try:
+        conn.executescript("""
+          CREATE TABLE users (Id INTEGER PRIMARY KEY, LastAccessDate DATETIME);
+          CREATE TABLE heroes (id INTEGER PRIMARY KEY, name TEXT, height_cm INTEGER);
+        """)
+        conn.executemany(
+            "INSERT INTO users VALUES (?, ?)",
+            [
+                (1, "2014-08-31 22:00:00.000"),
+                (2, "2014-09-01 14:23:10.000"),
+                (3, "2014-09-02 09:15:00.000"),
+            ],
+        )
+        conn.executemany(
+            "INSERT INTO heroes VALUES (?, ?, ?)",
+            [(1, "Hulk", 244), (2, "Thor", 198)],
+        )
+        conn.commit()
+      finally:
+        conn.close()
+
+      schema = DatabaseSchema(
+          db_id="iter4_traps",
+          tables=(
+              TableSchema(
+                  "users",
+                  (
+                      ColumnSchema("Id", "INTEGER", is_primary_key=True),
+                      ColumnSchema(
+                          "LastAccessDate",
+                          "DATETIME",
+                          value_range=(
+                              "2014-08-31 22:00:00.000",
+                              "2014-09-02 09:15:00.000",
+                          ),
+                      ),
+                  ),
+              ),
+              TableSchema(
+                  "heroes",
+                  (
+                      ColumnSchema("id", "INTEGER", is_primary_key=True),
+                      ColumnSchema("name", "TEXT"),
+                      ColumnSchema("height_cm", "INTEGER"),
+                  ),
+              ),
+          ),
+      )
+      sandbox = SQLiteReadOnlySandbox(SandboxPolicy(allowed_db_root=root))
+      argus = ArgusSQLPipeline(_Iter4TrapMockLLM(), sandbox)
+
+      # 1. Zero-token `DATE(LastAccessDate)` repair recovers `((1,),)` (not 2)
+      #    without spending a single Stage 4b repair token (`3 * 90 = 270`)!
+      t_ts = NLQueryTask(
+          "533",
+          "iter4_traps",
+          "How many users last accessed the website after 2014/9/1?",
+          "last accessed after 2014/9/1 refers to LastAccessDate > '2014-09-01'",
+          QueryDifficulty.SIMPLE,
+      )
+      p_ts = argus.predict(t_ts, schema, db_file)
+      self.assertIn("DATE(LastAccessDate) > '2014-09-01'", p_ts.final_sql)
+      self.assertEqual(sandbox.execute(db_file, p_ts.final_sql).rows, ((1,),))
+      self.assertEqual(p_ts.total_tokens, 270)
+
+      # 2. `MISSING_WINDOW_RANK` routes imperative `Rank ... by ...` to Stage 4b!
+      t_rk = NLQueryTask(
+          "726",
+          "iter4_traps",
+          "Rank heroes by their height in descending order.",
+          "",
+          QueryDifficulty.MODERATE,
+      )
+      p_rk = argus.predict(t_rk, schema, db_file)
+      self.assertIn("RANK() OVER", p_rk.final_sql)
+      self.assertEqual(
+          sandbox.execute(db_file, p_rk.final_sql).rows,
+          (("Hulk", 244, 1), ("Thor", 198, 2)),
+      )
+
 
 if __name__ == "__main__":
   unittest.main()

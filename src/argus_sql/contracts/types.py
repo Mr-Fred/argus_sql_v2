@@ -165,8 +165,10 @@ class IntentFrame:
     requires_extrema_order: True if superlative min/max/top-k cues appear.
     expected_projection_arity: Estimated column count requested (`>= 1`).
     complexity: Estimated query complexity routing tier.
+    strict_single_column: True when formula evidence mandates a 1-column scalar.
   """
 
+  # Preserves both raw utterance and normalized intent for downstream stages.
   raw_question: str
   canonical_question: str
   disfluencies_removed: int
@@ -175,6 +177,7 @@ class IntentFrame:
   requires_extrema_order: bool
   expected_projection_arity: int
   complexity: QueryDifficulty
+  strict_single_column: bool = False
 
 
 # Output of hybrid value-grounded + Steiner FK-closure schema linking.

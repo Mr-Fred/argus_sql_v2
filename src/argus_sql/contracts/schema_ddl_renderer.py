@@ -78,10 +78,15 @@ def _format_column_entry(
     notes.append(f"matched_values: [{joined_hits}]")
   if col.value_range is not None:
     notes.append(_format_range_note(col))
-  elif col.value_examples and not grounded_literals:
-    # Omit redundant `examples:` when `range:` or `matched_values:` is present.
-    joined_ex = ", ".join(repr(val) for val in col.value_examples[:2])
-    notes.append(f"examples: [{joined_ex}]")
+  elif col.value_examples:
+    # Retain distinct `examples:` when `matched_values:` is absent or when
+    # `description` is empty so undocumented columns preserve domain context.
+    distinct_ex = [
+        ex for ex in col.value_examples if ex not in grounded_literals
+    ]
+    if distinct_ex and (not grounded_literals or not col.description):
+      joined_ex = ", ".join(repr(val) for val in distinct_ex[:2])
+      notes.append(f"examples: [{joined_ex}]")
 
   return (col_decl, " | ".join(notes))
 

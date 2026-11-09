@@ -1,50 +1,16 @@
 """Voice-aware natural language intent canonicalizer and complexity classifier.
 
-Transforms raw user questions—including noisy spoken ASR transcripts with
-fillers, stutters, spoken numbers, and colloquial ratio phrasing—into clean
-IntentFrame structures before schema linking and SQL candidate synthesis.
+Transforms user questions and ASR transcripts into structured IntentFrame
+contracts capturing grounded entity candidates, expected projection arity,
+scalar formula constraints, and analytical complexity routing tiers.
 """
 
 import re
 
 from argus_sql.contracts.types import IntentFrame
 from argus_sql.contracts.types import QueryDifficulty
-
-# Spoken filler phrases ordered longest-first to avoid partial residue.
-_DISFLUENCY_PATTERNS: tuple[re.Pattern[str], ...] = (
-    re.compile(r"\b(?:uh+|um+|er+|ah+|hmm+)\b[,\s]*", re.IGNORECASE),
-    re.compile(r"\b(?:you know|i mean|sort of|kind of)\b[,\s]*", re.IGNORECASE),
-    re.compile(
-        r"^(?:hey\s+|okay\s+|so\s+|well\s+|please\s+)*"
-        r"(?:can you\s+|could you\s+)?(?:please\s+)?"
-        r"(?:tell me|show me|find out|let me know)\s+",
-        re.IGNORECASE,
-    ),
-)
-
-# Repeated consecutive word stutter regex (e.g., 'what is the the highest').
-_STUTTER_RE = re.compile(r"\b([a-zA-Z]{2,})\s+\1\b", re.IGNORECASE)
-
-# Spoken cardinal and ordinal number words frequently emitted by ASR engines.
-_SPOKEN_NUMBERS: dict[str, str] = {
-    "zero": "0",
-    "one": "1",
-    "two": "2",
-    "three": "3",
-    "four": "4",
-    "five": "5",
-    "six": "6",
-    "seven": "7",
-    "eight": "8",
-    "nine": "9",
-    "ten": "10",
-    "eleven": "11",
-    "twelve": "12",
-    "fifteen": "15",
-    "twenty": "20",
-    "fifty": "50",
-    "hundred": "100",
-}
+from argus_sql.linking.asr_normalizer import ENTITY_STOPWORDS
+from argus_sql.linking.asr_normalizer import clean_asr_utterance
 
 # Common spoken geographic/domain abbreviations mapped to canonical forms.
 _SPOKEN_EXPANSIONS: tuple[tuple[str, str], ...] = (
@@ -78,38 +44,15 @@ _CHALLENGING_CUE_RE = re.compile(
     re.IGNORECASE,
 )
 
-
-def _normalize_spoken_numbers(text: str) -> str:
-  """Converts spoken number tokens after limit/comparison words into digits."""
-  tokens = text.split()
-  converted: list[str] = []
-  # Convert number words when preceded by 'top', 'bottom', 'over', 'exceed', etc.
-  trigger_prev = {
-      "top",
-      "bottom",
-      "first",
-      "last",
-      "over",
-      "under",
-      "than",
-      "least",
-      "most",
-      "above",
-      "below",
-  }
-  for idx, tok in enumerate(tokens):
-    clean = tok.strip(".,?!").lower()
-    prev = tokens[idx - 1].lower() if idx > 0 else ""
-    if clean in _SPOKEN_NUMBERS and (prev in trigger_prev or clean != "one"):
-      suffix = tok[len(tok.rstrip(".,?!")) :]
-      converted.append(_SPOKEN_NUMBERS[clean] + suffix)
-    else:
-      converted.append(tok)
-  return " ".join(converted)
+# Matches imperative `Rank <entities> by <metric>` analytical ranking prompts.
+_IMPERATIVE_RANK_RE = re.compile(
+    r"^(?:please\s+)?rank\s+(?!of\b)\S+[\s\S]*\bby\b",
+    re.IGNORECASE,
+)
 
 
 def _extract_entity_candidates(question: str, evidence: str) -> tuple[str, ...]:
-  """Extracts quoted literals, capitalized spans, codes, and spoken expansions."""
+  """Extracts quoted literals, proper nouns, domain IDs, and spoken codes."""
   spans: list[str] = []
   combined = f"{question} {evidence}".strip()
 
@@ -119,31 +62,29 @@ def _extract_entity_candidates(question: str, evidence: str) -> tuple[str, ...]:
     if val and val not in spans:
       spans.append(val)
 
-  # 2. Capture capitalized multi-word Proper Noun phrases (e.g., 'Los Angeles').
+  # 2. Capture capitalized Proper Noun phrases after stripping leading stopwords
+  # so 'Between DC' yields 'DC' while 'There' / 'Consider' are discarded.
   for match in re.finditer(
       r"\b([A-Z][a-zA-Z0-9&.-]+(?:\s+[A-Z][a-zA-Z0-9&.-]+){0,3})\b",
       combined,
   ):
-    phrase = match.group(1).strip()
-    if phrase.lower() not in {
-        "what",
-        "which",
-        "where",
-        "when",
-        "who",
-        "how",
-        "list",
-        "find",
-        "give",
-        "please",
-        "among",
-        "calculate",
-        "select",
-    }:
-      if phrase not in spans:
-        spans.append(phrase)
+    words = match.group(1).strip().split()
+    while words and words[0].lower() in ENTITY_STOPWORDS:
+      words.pop(0)
+    phrase = " ".join(words)
+    if phrase and phrase.lower() not in ENTITY_STOPWORDS and phrase not in spans:
+      spans.append(phrase)
 
-  # 3. Capture hyphen-prefixed domain codes (e.g., 'czk-paying' -> 'czk').
+  # 3. Capture alphanumeric domain IDs ('TR004_8_9', 'tr004_8_9', 'TR008').
+  for match in re.finditer(
+      r"\b([a-zA-Z]{1,8}_[a-zA-Z0-9_]+|[a-zA-Z]{2,6}\d+[a-zA-Z0-9_]*)\b",
+      combined,
+  ):
+    code_id = match.group(1).strip()
+    if code_id not in spans:
+      spans.append(code_id)
+
+  # 4. Capture hyphen-prefixed codes ('czk-paying') and '-ly funded' statuses.
   for match in re.finditer(
       r"\b([a-zA-Z]{2,6})-(?:paying|based|funded|run|level|type)\b",
       question,
@@ -152,8 +93,20 @@ def _extract_entity_candidates(question: str, evidence: str) -> tuple[str, ...]:
     code_tok = match.group(1).strip()
     if code_tok not in spans:
       spans.append(code_tok)
+  for match in re.finditer(
+      r"\b([a-zA-Z]{3,15}ly\s+(?:funded|owned|operated|managed|run|based))\b",
+      question,
+      re.IGNORECASE,
+  ):
+    status_phrase = match.group(1).strip()
+    if status_phrase not in spans:
+      spans.append(status_phrase)
 
-  # 4. Capture lowercase/mixed n-grams after relational prepositions and cues.
+  # 5. Capture n-grams after relational prepositions while skipping determiners.
+  det_skip = {
+      "the", "each", "all", "any", "this", "that", "these", "those",
+      "their", "his", "her", "its", "our", "a", "an",
+  }
   for match in re.finditer(
       r"\b(?:in|for|named|called|county|state|status|type|currency|segment"
       r"|country|tagged|code)\s+"
@@ -161,11 +114,15 @@ def _extract_entity_candidates(question: str, evidence: str) -> tuple[str, ...]:
       question,
       re.IGNORECASE,
   ):
-    candidate = match.group(1).strip()
-    if candidate.lower() not in {"the", "each", "all", "any"} and candidate not in spans:
-      spans.append(candidate)
+    cand_words = [
+        w for w in match.group(1).strip().split() if w.lower() not in det_skip
+    ]
+    if cand_words and cand_words[0].lower() not in ENTITY_STOPWORDS:
+      cand = " ".join(cand_words)
+      if cand not in spans:
+        spans.append(cand)
 
-  # 5. Add canonical forms for common spoken abbreviations.
+  # 6. Add canonical forms for common spoken geographic abbreviations.
   lower_q = question.lower()
   for abbrev, expanded in _SPOKEN_EXPANSIONS:
     if re.search(rf"\b{re.escape(abbrev)}(?:\b|$)", lower_q):
@@ -186,17 +143,22 @@ def _estimate_projection_arity(canonical_q: str) -> int:
   ):
     return 1
 
-  # Multi-sentence narrative briefings (>38 words or >=2 sentences) frequently
-  # specify custom 4..16 column schemas; leave unconstrained (`0`) to avoid drift.
+  # Multi-sentence narrative briefings (>38 words or >=2 periods) frequently
+  # specify custom 4..16 column schemas; leave unconstrained (`0`).
   body_no_end = canonical_q.rstrip(".?!")
   if len(canonical_q.split()) > 38 or body_no_end.count(".") >= 2:
     return 0
 
-  # Expand compound multi-field shorthand common in BIRD-SQL prompts.
+  # Expand compound multi-field shorthand; leave plural 'full names' unconstrained
+  # because schemas represent full names across 1, 2, 3, or 6 columns.
   if "full communication address" in lower or "complete address" in lower:
     return 4
   if "full names" in lower:
-    return 4
+    return 0
+
+  # Imperative `Rank <entities> by <metric>` projects `(entity, metric, rank)`.
+  if _IMPERATIVE_RANK_RE.match(canonical_q):
+    return 3
 
   # Detect multi-pair comparison tails ('between A and B, B and C, and C and A').
   pair_tail = re.search(
@@ -220,20 +182,22 @@ def _estimate_projection_arity(canonical_q: str) -> int:
   ):
     return 2
 
-  # Inspect sentence-anchored projection directives (avoiding relative 'that include').
+  # Inspect follow-up projection sentences after `.`, `;`, or `?` (`? Show ...`,
+  # `? Indicate ...`) while ignoring decimal-rounding instructions.
   followup = re.search(
-      r"(?:(?:^|[.;])\s*(?:please\s+)?(?:indicate|include|provide)\s+"
-      r"|\b(?:along\s+with|as\s+well\s+as)\s+)([^?.!;]{3,55})",
+      r"(?:[.;?]\s*(?:please\s+)?(?:indicate|include|provide|show|identify|"
+      r"state|list|give)\s+|\b(?:along\s+with|as\s+well\s+as)\s+)([^?.!;]{3,90})",
       lower,
   )
   if followup:
-    extra_parts = [
-        p.strip()
-        for p in re.split(r",|\band\b|\bas\s+well\s+as\b", followup.group(1))
-        if p.strip() and len(p.split()) <= 6
-    ]
-    if extra_parts:
-      return max(2, min(1 + len(extra_parts), 5))
+    tail_clause = followup.group(1).strip()
+    if not re.match(r"^(?:your\s+answer|the\s+answer|it\s+as)\b", tail_clause):
+      extra_parts = [
+          p.strip()
+          for p in re.split(r",|\band\b|\bas\s+well\s+as\b", tail_clause)
+          if p.strip() and len(p.split()) <= 6
+      ]
+      return max(2, min(1 + len(extra_parts), 5)) if extra_parts else 2
 
   # Explicit single-sentence scalar aggregations ('how many', 'what is the avg').
   if re.match(
@@ -241,11 +205,14 @@ def _estimate_projection_arity(canonical_q: str) -> int:
       r"rate|percentage|number|count|highest|lowest|maximum|minimum|difference))\b",
       lower,
   ):
-    if " and " not in lower[:55] and "." not in body_no_end:
+    if (
+        " and " not in lower[:55]
+        and "." not in body_no_end
+        and "?" not in body_no_end
+    ):
       return 1
 
-  # Look for compact 'list/give/show/what are the X and Y of/for' projections
-  # (excluding 'state' which frequently appears as the noun 'in the state').
+  # Look for compact 'list/give/show/what are the X and Y of/for' projections.
   proj_match = re.search(
       r"\b(?:list|give|show|what\s+are)\s+(?:the\s+|each\s+)?"
       r"([^,?.!;]{1,40}(?:,\s*[^,?.!;]{1,30})*(?:\s+and\s+[^,?.!;]{1,30})?)\s+"
@@ -253,10 +220,9 @@ def _estimate_projection_arity(canonical_q: str) -> int:
       lower,
   )
   if proj_match:
-    clause = proj_match.group(1)
     parts = [
         p.strip()
-        for p in re.split(r",|\band\b", clause)
+        for p in re.split(r",|\band\b", proj_match.group(1))
         if p.strip() and len(p.split()) <= 6
     ]
     if parts:
@@ -274,49 +240,46 @@ def canonicalize_intent(question: str, evidence: str = "") -> IntentFrame:
   Returns:
     Structured IntentFrame guiding value retrieval, linking, and verification.
   """
-  cleaned = question.strip()
-  removed_count = 0
-
-  # Strip spoken filler tokens and conversational preambles iteratively.
-  for pattern in _DISFLUENCY_PATTERNS:
-    cleaned, n_subs = pattern.subn("", cleaned)
-    removed_count += n_subs
-
-  # Collapse consecutive word stutters ('the the' -> 'the').
-  cleaned, n_stutters = _STUTTER_RE.subn(r"\1", cleaned)
-  removed_count += n_stutters
-
-  # Normalize spoken number words and collapse extra whitespace.
-  cleaned = _normalize_spoken_numbers(cleaned)
-  cleaned = re.sub(r"\s+", " ", cleaned).strip()
-  if cleaned:
-    cleaned = cleaned[0].upper() + cleaned[1:]
+  # Delegate spoken filler removal and ASR casing alignment to `asr_normalizer`.
+  cleaned, removed_count = clean_asr_utterance(question, evidence)
 
   combined = f"{cleaned} {evidence}"
   needs_float_div = bool(
       _DIVISION_CUE_RE.search(combined) or "/" in evidence
   )
   needs_extrema = bool(_EXTREMA_CUE_RE.search(cleaned))
+  is_rank_query = bool(_IMPERATIVE_RANK_RE.match(cleaned))
   entities = _extract_entity_candidates(cleaned, evidence)
   arity = _estimate_projection_arity(cleaned)
+  # Explicit `calculation =` evidence without follow-up columns mandates arity 1.
+  strict_single = bool(
+      arity == 1 and re.search(r"\bcalculation\s*=", evidence, re.IGNORECASE)
+  )
 
-  # Route query difficulty based on analytical cues, formulas, and entities.
+  # Route query difficulty based on analytical cues, window ranks, and formulas.
   if _CHALLENGING_CUE_RE.search(combined) or (
       needs_float_div and needs_extrema
   ):
     complexity = QueryDifficulty.CHALLENGING
-  elif needs_float_div or needs_extrema or len(entities) >= 2 or evidence.strip():
+  elif (
+      needs_float_div
+      or needs_extrema
+      or is_rank_query
+      or len(entities) >= 2
+      or evidence.strip()
+  ):
     complexity = QueryDifficulty.MODERATE
   else:
     complexity = QueryDifficulty.SIMPLE
 
   return IntentFrame(
       raw_question=question,
-      canonical_question=cleaned or question.strip(),
+      canonical_question=cleaned,
       disfluencies_removed=removed_count,
       entities=entities,
       requires_floating_division=needs_float_div,
       requires_extrema_order=needs_extrema,
       expected_projection_arity=arity,
       complexity=complexity,
+      strict_single_column=strict_single,
   )

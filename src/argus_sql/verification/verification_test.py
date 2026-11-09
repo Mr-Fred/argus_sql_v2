@@ -499,6 +499,109 @@ class VerificationAndArbiterTest(unittest.TestCase):
     self.assertEqual(b_issues[0].code, "BOOLEAN_AVG_FOR_COUNT")
     self.assertEqual(b_issues[0].severity, "ERROR")
 
+  def test_iteration4_timestamp_date_rewrite_window_rank_and_strict_arity(
+      self,
+  ) -> None:
+    """Audits & repairs bare DATETIME comparisons (I11), window ranks (I12), & arity."""
+    # 1. `TIMESTAMP_BARE_DATE_COMPARISON` (I11) flags sub-day timestamp columns
+    #    and rewrites to `DATE(col)` at 0 token cost while ignoring pure DATE cols!
+    ts_ddl = (
+        "CREATE TABLE users (\n"
+        "  Id INTEGER PRIMARY KEY,\n"
+        "  LastAccessDate DATETIME, -- range: '2010-07-19 19:39:07.000'..'2014-09-14 00:10:02.000'\n"
+        "  BirthDay DATE -- range: '1980-01-01'..'2005-12-31'\n"
+        ");"
+    )
+    linked_ts = LinkedSchemaContext(
+        "community", ("users",), (), (), (), (), ts_ddl
+    )
+    ts_intent = canonicalize_intent(
+        "How many users last accessed the website after 2014/9/1?",
+        evidence="last accessed after 2014/9/1 refers to LastAccessDate > '2014-09-01'",
+    )
+    bare_ts = SQLCandidate(
+        "SELECT COUNT(*) FROM users WHERE LastAccessDate > '2014-09-01'",
+        "decomposed_cot",
+    )
+    pure_dt = SQLCandidate(
+        "SELECT COUNT(*) FROM users WHERE BirthDay > '1990-01-01'",
+        "decomposed_cot",
+    )
+    sig_bad = compute_result_signature(((42,),))
+    sig_good = compute_result_signature(((37,),))
+    out_bad = ExecutionOutcome(True, ((42,),), ("cnt",), 1, 1.0, "", sig_bad)
+    out_good = ExecutionOutcome(True, ((37,),), ("cnt",), 1, 1.0, "", sig_good)
+
+    ts_issues = audit_candidate_invariants(bare_ts, out_bad, ts_intent, linked_ts)
+    self.assertEqual([i.code for i in ts_issues], ["TIMESTAMP_BARE_DATE_COMPARISON"])
+    self.assertEqual(ts_issues[0].severity, "ERROR")
+    # Pure DATE column (`range: '1980-01-01'..'2005-12-31'`) produces 0 issues!
+    self.assertEqual(
+        audit_candidate_invariants(pure_dt, out_good, ts_intent, linked_ts), ()
+    )
+    # Zero-token algebraic repair wraps `LastAccessDate` in `DATE(...)` idempotently.
+    ts_rep = apply_algebraic_sql_repairs(bare_ts, ts_issues, linked_ts)
+    self.assertIsNotNone(ts_rep)
+    assert ts_rep is not None
+    self.assertEqual(
+        ts_rep.sql,
+        "SELECT COUNT(*) FROM users WHERE DATE(LastAccessDate) > '2014-09-01'",
+    )
+    self.assertEqual(
+        audit_candidate_invariants(ts_rep, out_good, ts_intent, linked_ts), ()
+    )
+
+    # 2. `MISSING_WINDOW_RANK` (I12) flags imperative `Rank X by Y` queries
+    #    missing `RANK() OVER (...)`, without false-alarming on `did X rank highest?`.
+    rank_intent = canonicalize_intent(
+        "Rank heroes published by Marvel Comics by their height in descending order."
+    )
+    no_rank_sql = SQLCandidate(
+        "SELECT superhero_name, height_cm, 1 FROM superhero ORDER BY height_cm DESC",
+        "decomposed_cot",
+    )
+    with_rank_sql = SQLCandidate(
+        "SELECT superhero_name, height_cm, RANK() OVER (ORDER BY height_cm DESC) "
+        "FROM superhero",
+        "formula_defensive",
+    )
+    r_out = ExecutionOutcome(
+        True, (("Hulk", 244, 1),), ("n", "h", "r"), 1, 1.0, "", sig_good
+    )
+    r_issues = audit_candidate_invariants(no_rank_sql, r_out, rank_intent)
+    self.assertIn("MISSING_WINDOW_RANK", {i.code for i in r_issues})
+    self.assertEqual(audit_candidate_invariants(with_rank_sql, r_out, rank_intent), ())
+    non_window_q = canonicalize_intent("In which race did Hamilton rank the highest?")
+    one_out = ExecutionOutcome(True, (("Monaco",),), ("r",), 1, 1.0, "", sig_good)
+    self.assertEqual(
+        audit_candidate_invariants(
+            SQLCandidate(
+                "SELECT name FROM races WHERE rank IS NOT NULL ORDER BY rank ASC LIMIT 1",
+                "cot",
+            ),
+            one_out,
+            non_window_q,
+        ),
+        (),
+    )
+
+    # 3. `strict_single_column` penalizes 2-col drift on `calculation =` tasks.
+    calc_intent = canonicalize_intent(
+        "Between DC and Marvel Comics, which publisher published more? "
+        "Find the difference.",
+        evidence="calculation = SUBTRACT(SUM(a), SUM(b))",
+    )
+    c_two = SQLCandidate("SELECT 'Marvel', 120", "skeleton_minimal")
+    c_one = SQLCandidate("SELECT 120", "decomposed_cot")
+    o_two = ExecutionOutcome(
+        True, (("Marvel", 120),), ("p", "d"), 1, 1.0, "", sig_bad
+    )
+    o_one = ExecutionOutcome(True, ((120,),), ("d",), 1, 1.0, "", sig_good)
+    win_calc, _, _ = verify_and_rank_candidates(
+        (c_two, c_two, c_one), (o_two, o_two, o_one), calc_intent
+    )
+    self.assertEqual(win_calc.outcome.result_signature, sig_good)
+
 
 if __name__ == "__main__":
   unittest.main()

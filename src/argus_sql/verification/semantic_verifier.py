@@ -12,6 +12,8 @@ from argus_sql.contracts.types import IntentFrame
 from argus_sql.contracts.types import InvariantIssue
 from argus_sql.contracts.types import LinkedSchemaContext
 from argus_sql.contracts.types import SQLCandidate
+from argus_sql.verification.dialect_invariants import check_missing_window_rank
+from argus_sql.verification.dialect_invariants import check_timestamp_bare_date_comparison
 from argus_sql.verification.relational_invariants import check_boolean_avg_for_count
 from argus_sql.verification.relational_invariants import check_left_join_filtered_ratio
 from argus_sql.verification.relational_invariants import check_non_key_entity_grouping
@@ -268,13 +270,17 @@ def audit_candidate_invariants(
         )
 
   # 6. Check projection arity alignment when non-empty rows were returned.
-  # Allow +-1 column slack so optional label+value pairs are not over-penalized.
+  # Allow +-1 column slack unless `calculation =` mandates a strict 1-col scalar.
   actual_arity = len(outcome.column_names)
+  is_arity_drift = (
+      (intent.strict_single_column and actual_arity != 1)
+      or abs(actual_arity - intent.expected_projection_arity) >= 2
+  )
   if (
       outcome.row_count > 0
       and actual_arity > 0
       and intent.expected_projection_arity > 0
-      and abs(actual_arity - intent.expected_projection_arity) >= 2
+      and is_arity_drift
   ):
     issues.append(
         InvariantIssue(
@@ -315,12 +321,14 @@ def audit_candidate_invariants(
           )
       )
 
-  # 8-10. Audit multi-table relational join ratios, boolean AVG, and entity keys.
+  # 8-12. Audit relational ratios, entity keys, boolean AVG, timestamps & ranks.
   ddl_text = linked_schema.ddl_prompt if linked_schema is not None else ""
   for rel_issue in (
       check_left_join_filtered_ratio(sql_text, no_strings_sql, no_quotes_sql, ddl_text),
       check_boolean_avg_for_count(no_quotes_sql, intent),
       check_non_key_entity_grouping(sql_text),
+      check_timestamp_bare_date_comparison(sql_text, ddl_text),
+      check_missing_window_rank(no_quotes_sql, intent),
   ):
     if rel_issue is not None:
       issues.append(rel_issue)

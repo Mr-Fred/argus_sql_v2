@@ -16,10 +16,24 @@ As conversational and voice-driven interfaces become a primary way humans intera
 
 **Argus-SQL** systematically implements, compares, and recombines modular NL2SQL operators into a fast, voice-ready four-stage architecture:
 
-1. **Voice & Intent Canonicalizer (`linking/intent_canonicalizer.py`)**: Strips ASR disfluencies/stutters, normalizes spoken cardinals (`"top five"` -> `top 5`), extracts hyphenated/short lowercase domain codes, and estimates complexity & multi-pair/dual-extrema projection arity.
-2. **Exact Short-Code + 3-Gram Cell Value Index, `MIN..MAX` Domain Ranges & Implicit/Junction FK Closure (`linking/value_retriever.py`, `linking/schema_graph.py`, `linking/fk_schema_linker.py`, `evaluation/bird_metadata.py`)**: Grounds messy string cells and 2–3 character domain codes in sub-millisecond time, hydrates batched read-only `MIN..MAX` temporal/numeric domain bounds (`range: '2012-08-23'..'2012-08-26'`, `range: 0.0018..1.0`) alongside CSV value codebooks, splits compound identifiers (`gasstations` -> `gas`, `station`) and localization stems (`translation` -> `foreign`/`language`), retains 100% of columns on tables up to 50 columns, and recovers explicit, implicit PK-matched, and M:N junction bridge tables (`99.8%+` table recall and `100%` column recall across `bird_mini_dev`).
+1. **Voice & Intent Canonicalizer (`linking/asr_normalizer.py`, `linking/intent_canonicalizer.py`)**: Strips ASR disfluencies/stutters, normalizes spoken cardinals (`"top five"` -> `top 5`), restores multi-sentence capitalization, terminal punctuation, and `evidence`-grounded entity/code casing (`TR004_8_9`, `Marvel Comics`, `DC`), and estimates projection arity across `? Show` / `? Indicate` follow-up sentences, imperative `Rank X by Y` queries (`3`), and `calculation =` single-column locks.
+2. **Hierarchy-Aware 3-Gram Cell Value Index, `MIN..MAX` Domain Ranges & Implicit/Junction FK Closure (`linking/value_retriever.py`, `linking/schema_graph.py`, `linking/fk_schema_linker.py`, `evaluation/bird_metadata.py`)**: Grounds messy string cells and 2–3 character domain codes in `< 1 ms`, suppresses unquoted column-qualifier (`(K-12)`) and schema-word prefix noise plus high-cardinality (`City` / `MailCity`) shadows when a canonical low-cardinality dimension (`County`) matches the identical string, hydrates batched read-only `MIN..MAX` temporal/numeric domain bounds (`range: '2012-08-23'..'2012-08-26'`), retains 100% of columns on tables up to 50 columns, and recovers explicit, implicit PK-matched, and M:N junction bridge tables (`99.8%+` table recall and `100%` column recall across `bird_mini_dev`).
 3. **Complexity-Gated Diverse Batch Synthesis (`pipelines/argus_pipeline.py`)**: Renders valid composite `PRIMARY KEY (...)` grain DDL, routes simple lookups through a $K=1$ Voice Fast-Path, and dispatches $K=3$ diverse strategies concurrently (`decomposed_cot`, `formula_defensive`, `skeleton_minimal`) for analytical queries.
-4. **10-Invariant Semantic & Relational Verifier, Zero-Token Algebraic Repair & Lexicographic Consensus (`verification/`)**: Audits live outcomes in a C-authorizer-locked read-only SQLite sandbox (`sandbox/sqlite_sandbox.py`), deterministically repairs SQLite integer/parenthesized division, `NULL`-first sorts, `ILIKE`, exact-word literal casing, 1-to-many `JOIN` fanout duplicates (`SELECT DISTINCT`), and non-unique entity-name `GROUP BY` keys (`GROUP BY T.name` -> `GROUP BY fk_id`) in `< 1 ms`, flags 1-to-many filtered `LEFT JOIN` ratio distortion and row-level boolean `AVG(col = 'x')` count errors for Stage 4b diagnostic repair, and ranks equivalence clusters via lexicographic error-free consensus.
+4. **12-Invariant Semantic & Relational Verifier, Zero-Token Algebraic Repair & Lexicographic Consensus (`verification/`)**: Audits live outcomes in a C-authorizer-locked read-only SQLite sandbox (`sandbox/sqlite_sandbox.py`), deterministically repairs SQLite integer/parenthesized division, `NULL`-first sorts, `ILIKE`, exact-word literal casing, 1-to-many `JOIN` fanout duplicates (`SELECT DISTINCT`), non-unique entity-name `GROUP BY` keys (`GROUP BY T.name` -> `GROUP BY fk_id`), and bare `'YYYY-MM-DD'` predicates on sub-day timestamp columns (`DATE(col)`) in `< 1 ms`, flags 1-to-many filtered `LEFT JOIN` ratios, row-level boolean `AVG(col = 'x')` count errors, and missing `RANK() OVER (...)` window columns for Stage 4b diagnostic repair, and ranks equivalence clusters via lexicographic error-free consensus.
+
+---
+
+### Live Public `BIRD Mini-Dev` Evaluation (`gemini-3.7-flash`, $N = 110$ Stratified Across All 11 Databases)
+
+Evaluated across `1,100` total pipeline runs (`110` Clean + `110` spoken `Voice-BIRD` queries; `37` Simple, `37` Moderate, `36` Challenging; SHA-256 bundle `f4419f770134b474...` in `results/feedback/bird_feedback_bundle.json`):
+
+| System | Simple EX | Mod. EX | Chall. EX | Clean EX (%) | Clean R-VES | Voice EX (%) | Mean Tokens |
+| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
+| `B0_ZeroShotDDL` | 81.1 | 75.7 | 61.1 | 72.7 | 73.0 | **73.6** | 3647 |
+| `B1_DINDecomposed` | **83.8** | 75.7 | 58.3 | 72.7 | 73.6 | 70.9 | 3632 |
+| `B2_MACRefiner` | **83.8** | **81.1** | 55.6 | 73.6 | 73.6 | 70.9 | 2889 |
+| `B3_CHESSValueConsistency` | 78.4 | 78.4 | 55.6 | 70.9 | 71.6 | 70.9 | 10878 |
+| **`Argus-SQL` (Ours)** | 81.1 | 78.4 | **63.9** | **74.5** | **75.2** | 71.8 | 10985 |
 
 ---
 
@@ -50,11 +64,11 @@ PYTHONPATH=src python3 -m argus_sql.evaluation.cli --mode diagnostic
 
 | System | Simple EX | Mod. EX | Chall. EX | Clean EX (%) | Clean R-VES | Voice EX (%) | Mean Tokens |
 | :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
-| `B0_ZeroShotDDL` | 75.0 | 37.5 | 0.0 | 37.5 | 37.5 | 16.7 | 479 |
-| `B1_DINDecomposed` | 100.0 | 25.0 | 0.0 | 41.7 | 41.7 | 25.0 | 516 |
-| `B2_MACRefiner` | 100.0 | 37.5 | 0.0 | 45.8 | 45.8 | 25.0 | 518 |
-| `B3_CHESSValueConsistency` | 100.0 | 62.5 | 0.0 | 54.2 | 54.2 | 41.7 | 1568 |
-| **`Argus-SQL` (Ours)** | **100.0** | **100.0** | **100.0** | **100.0** | **100.0** | **100.0** | **1410** |
+| `B0_ZeroShotDDL` | 75.0 | 37.5 | 0.0 | 37.5 | 37.5 | 16.7 | 568 |
+| `B1_DINDecomposed` | 100.0 | 25.0 | 0.0 | 41.7 | 41.7 | 25.0 | 676 |
+| `B2_MACRefiner` | 100.0 | 37.5 | 0.0 | 45.8 | 45.8 | 25.0 | 677 |
+| `B3_CHESSValueConsistency` | 100.0 | 62.5 | 0.0 | 54.2 | 54.2 | 41.7 | 1966 |
+| **`Argus-SQL` (Ours)** | **100.0** | **100.0** | **100.0** | **100.0** | **100.0** | **100.0** | **1792** |
 
 > Paired two-sided exact McNemar test (`Argus-SQL` vs. `B3_CHESSValueConsistency`, $N = 48$ Clean + Voice queries): $p = 5.96 \times 10^{-8}$.
 

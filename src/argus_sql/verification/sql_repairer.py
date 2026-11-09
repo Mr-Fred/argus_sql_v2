@@ -11,6 +11,7 @@ import re
 from argus_sql.contracts.types import InvariantIssue
 from argus_sql.contracts.types import LinkedSchemaContext
 from argus_sql.contracts.types import SQLCandidate
+from argus_sql.verification.dialect_invariants import rewrite_timestamp_bare_date_comparisons
 from argus_sql.verification.relational_invariants import find_entity_name_grouping_rewrite
 
 # Atomic SQL token inside function arguments or parenthesized arithmetic groups.
@@ -235,6 +236,15 @@ def apply_algebraic_sql_repairs(
     if gb_rw is not None:
       gb_start, gb_end, _, target_key = gb_rw
       repaired = f"{repaired[:gb_start]}{target_key}{repaired[gb_end:]}"
+
+  # 6. Wrap sub-day timestamp columns in `DATE(col)` on `'YYYY-MM-DD'` filters.
+  if (
+      "TIMESTAMP_BARE_DATE_COMPARISON" in issue_codes
+      and linked_schema is not None
+  ):
+    repaired = rewrite_timestamp_bare_date_comparisons(
+        repaired, linked_schema.ddl_prompt
+    )
 
   # Return None when rewrites produced no diff to avoid duplicate sandbox runs.
   if repaired == candidate.sql.strip().rstrip(";"):
