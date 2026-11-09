@@ -3,34 +3,42 @@
 ## 1. Run Provenance & Integrity
 
 - **Schema**: `argus_feedback.v1`
-- **Created (UTC)**: `2026-11-09T10:40:43Z`
+- **Created (UTC)**: `2026-11-09T13:51:01Z`
 - **Provider / Model**: `vertex` / `gemini-3.7-flash`
 - **Dataset Split**: `mini_dev_sqlite.json`
-- **Source Commit**: `4b1dc4c54a70`
-- **Payload SHA-256**: `f2421c9a8dfbe4ab...` (verified)
+- **Source Commit**: `9b9e0c571c81`
+- **Payload SHA-256**: `59b2c3f6429603b0...` (verified)
 
 ## 2. Leaderboard Summary
 
 | Suite | System | Tasks | EX (%) | Simple | Mod. | Chall. | R-VES | p50 (ms) | Mean Tok |
 | :--- | :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
-| BIRD-Dev Clean | `B0_ZeroShotDDL` | 110 | **72.7** | 81.1 | 75.7 | 61.1 | 73.0 | 5869.0 | 3647 |
-| BIRD-Dev Clean | `B1_DINDecomposed` | 110 | **72.7** | 83.8 | 75.7 | 58.3 | 73.6 | 6329.8 | 3632 |
-| BIRD-Dev Clean | `B2_MACRefiner` | 110 | **73.6** | 83.8 | 81.1 | 55.6 | 73.6 | 5730.7 | 2889 |
-| BIRD-Dev Clean | `B3_CHESSValueConsistency` | 110 | **70.9** | 78.4 | 78.4 | 55.6 | 71.6 | 11563.2 | 10878 |
+| BIRD-Dev Clean | `B0_RawDDL` | 110 | **70.9** | 81.1 | 73.0 | 58.3 | 71.6 | 5238.2 | 1926 |
+| BIRD-Dev Clean | `B0+_EnrichedMDDL` | 110 | **72.7** | 81.1 | 75.7 | 61.1 | 73.0 | 5869.0 | 3647 |
+| BIRD-Dev Clean | `B1_LexicalCoT` | 110 | **72.7** | 83.8 | 75.7 | 58.3 | 73.6 | 6329.8 | 3632 |
+| BIRD-Dev Clean | `B2_ExecRefiner` | 110 | **73.6** | 83.8 | 81.1 | 55.6 | 73.6 | 5730.7 | 2889 |
+| BIRD-Dev Clean | `B3_ValueMajorityVote` | 110 | **77.3** | 81.1 | 86.5 | 63.9 | 78.0 | 6207.4 | 11416 |
+| BIRD-Dev Clean | `B4_LLMJudge` | 110 | **76.4** | 83.8 | 86.5 | 58.3 | 77.0 | 8125.7 | 11783 |
 | BIRD-Dev Clean | `Argus-SQL` | 110 | **75.5** | 83.8 | 83.8 | 58.3 | 76.4 | 12962.5 | 11532 |
-| BIRD-Dev Voice | `B0_ZeroShotDDL` | 110 | **73.6** | 81.1 | 78.4 | 61.1 | 73.9 | 6599.6 | 3650 |
-| BIRD-Dev Voice | `B1_DINDecomposed` | 110 | **70.9** | 78.4 | 75.7 | 58.3 | 70.9 | 6763.9 | 3622 |
-| BIRD-Dev Voice | `B2_MACRefiner` | 110 | **70.9** | 78.4 | 78.4 | 55.6 | 70.0 | 4234.7 | 2307 |
-| BIRD-Dev Voice | `B3_CHESSValueConsistency` | 110 | **70.9** | 78.4 | 78.4 | 55.6 | 71.4 | 12642.5 | 10933 |
+| BIRD-Dev Voice | `B0_RawDDL` | 110 | **69.1** | 78.4 | 73.0 | 55.6 | 69.5 | 5793.3 | 1944 |
+| BIRD-Dev Voice | `B0+_EnrichedMDDL` | 110 | **73.6** | 81.1 | 78.4 | 61.1 | 73.9 | 6599.6 | 3650 |
+| BIRD-Dev Voice | `B1_LexicalCoT` | 110 | **70.9** | 78.4 | 75.7 | 58.3 | 70.9 | 6763.9 | 3622 |
+| BIRD-Dev Voice | `B2_ExecRefiner` | 110 | **70.9** | 78.4 | 78.4 | 55.6 | 70.0 | 4234.7 | 2307 |
+| BIRD-Dev Voice | `B3_ValueMajorityVote` | 110 | **74.5** | 83.8 | 81.1 | 58.3 | 75.0 | 7259.7 | 11514 |
+| BIRD-Dev Voice | `B4_LLMJudge` | 110 | **72.7** | 81.1 | 78.4 | 58.3 | 73.2 | 9549.6 | 11945 |
 | BIRD-Dev Voice | `Argus-SQL` | 110 | **75.5** | 83.8 | 81.1 | 61.1 | 75.9 | 4458.9 | 6836 |
 
-- **Paired McNemar (`Argus-SQL` vs `B0_ZeroShotDDL`, Clean, N=110)**: `p = 5.078e-01`
+- **Paired McNemar (`Argus-SQL` vs `B0_RawDDL`, Clean, N=110)**: `p = 2.668e-01`
 
-- **Paired McNemar (`Argus-SQL` vs `B1_DINDecomposed`, Clean, N=110)**: `p = 4.531e-01`
+- **Paired McNemar (`Argus-SQL` vs `B0+_EnrichedMDDL`, Clean, N=110)**: `p = 5.078e-01`
 
-- **Paired McNemar (`Argus-SQL` vs `B2_MACRefiner`, Clean, N=110)**: `p = 6.250e-01`
+- **Paired McNemar (`Argus-SQL` vs `B1_LexicalCoT`, Clean, N=110)**: `p = 4.531e-01`
 
-- **Paired McNemar (`Argus-SQL` vs `B3_CHESSValueConsistency`, Clean, N=110)**: `p = 1.250e-01`
+- **Paired McNemar (`Argus-SQL` vs `B2_ExecRefiner`, Clean, N=110)**: `p = 6.250e-01`
+
+- **Paired McNemar (`Argus-SQL` vs `B3_ValueMajorityVote`, Clean, N=110)**: `p = 6.250e-01`
+
+- **Paired McNemar (`Argus-SQL` vs `B4_LLMJudge`, Clean, N=110)**: `p = 1.000e+00`
 
 ## 3. Per-Database Accuracy (`Argus-SQL` Clean Split)
 
