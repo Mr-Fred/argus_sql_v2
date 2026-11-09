@@ -217,6 +217,56 @@ def _synthesize_relational_sql(req: LLMCompletionRequest) -> str:
   return " ".join(clauses)
 
 
+# Regex parsing `Option <LETTER>` SQL and execution preview blocks in B4 judge.
+_OPTION_BLOCK_RE = re.compile(
+    r"Option\s+([A-Z])\s*\(support:\s*(\d+)/\d+\s*candidates\):\s*\n"
+    r"SQL:\s*(.+?)\n"
+    r"Columns:\s*(.+?)\s*\|\s*Row Count:\s*(\d+)\s*\n"
+    r"Sample Rows:\s*(.+)",
+)
+
+
+def _evaluate_diagnostic_judge_prompt(req: LLMCompletionRequest) -> str:
+  """Selects the strongest SQLite option from prompt-visible execution previews."""
+  prompt = req.user_prompt
+  q_low = extract_prompt_section(prompt, "Question").lower()
+  evidence = extract_prompt_section(prompt, "External Evidence")
+  needs_ratio = ("/" in evidence) or any(
+      w in q_low
+      for w in ("rate", "ratio", "percentage", "percent", "proportion")
+  )
+  needs_min_guard = any(w in q_low for w in ("lowest", "smallest", "minimum"))
+
+  # Score each competing execution cluster using only prompt-visible previews.
+  best_choice = ("A", -999.0)
+  for match in _OPTION_BLOCK_RE.finditer(prompt):
+    label = match.group(1)
+    votes = int(match.group(2))
+    sql_upper = match.group(3).upper()
+    row_cnt = int(match.group(5))
+    preview = match.group(6).strip()
+
+    score = 0.1 * votes
+    # Penalize empty results and single-column NULL-only rows (`[(None,)]`).
+    if row_cnt == 0:
+      score -= 4.0
+    if "[(None,)" in preview:
+      score -= 3.5
+    # On ratio/rate prompts, prefer REAL casts over integer-truncated `[(0,)]`.
+    if needs_ratio:
+      if "CAST(" in sql_upper or "1.0" in sql_upper:
+        score += 2.0
+      if re.fullmatch(r"\[(?:\(0,\),?\s*)+\]", preview):
+        score -= 2.5
+    # On ascending minimum queries, reward explicit `IS NOT NULL` predicates.
+    if needs_min_guard and "IS NOT NULL" in sql_upper:
+      score += 1.0
+    if score > best_choice[1]:
+      best_choice = (label, score)
+
+  return f"Selected: Option {best_choice[0]}"
+
+
 class SchemaGuidedDiagnosticSynthesizer:
   """Deterministic BatchLLMPort synthesizing SQL from rendered prompt DDL.
 
@@ -240,6 +290,21 @@ class SchemaGuidedDiagnosticSynthesizer:
     responses: list[LLMCompletionResponse] = []
     # Process all batch prompts in-memory with deterministic token accounting.
     for req in requests:
+      if req.strategy_tag == "llm_judge":
+        choice_text = _evaluate_diagnostic_judge_prompt(req)
+        p_tokens = max(1, len(req.system_prompt + req.user_prompt) // 4)
+        c_tokens = max(1, len(choice_text) // 4)
+        responses.append(
+            LLMCompletionResponse(
+                request_id=req.request_id,
+                sql_text="",
+                raw_text=choice_text,
+                prompt_tokens=p_tokens,
+                completion_tokens=c_tokens,
+                from_cache=False,
+            )
+        )
+        continue
       sql = _synthesize_relational_sql(req)
       p_tokens = max(1, len(req.system_prompt + req.user_prompt) // 4)
       c_tokens = max(1, len(sql) // 4)

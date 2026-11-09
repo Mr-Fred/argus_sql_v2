@@ -33,6 +33,15 @@ _DIFFICULTY_ROTATION: tuple[QueryDifficulty, ...] = (
     QueryDifficulty.CHALLENGING,
 )
 
+# Maps bit-for-bit identical pre-rename checkpoint keys onto canonical names.
+# Note: `B3_CHESSValueConsistency` is intentionally NOT aliased because
+# steelmanned `B3_ValueMajorityVote` adds multi-word surface entity extraction.
+_LEGACY_SYSTEM_ALIASES: dict[str, str] = {
+    "B0_ZeroShotDDL": "B0+_EnrichedMDDL",
+    "B1_DINDecomposed": "B1_LexicalCoT",
+    "B2_MACRefiner": "B2_ExecRefiner",
+}
+
 
 def _interleave_by_difficulty(
     db_tasks: Sequence[NLQueryTask],
@@ -197,7 +206,9 @@ class LiveRunCheckpointer:
         if not isinstance(obj, dict):
           continue
         suite_name = str(obj["suite_name"])
-        system_name = str(obj["system_name"])
+        raw_sys = str(obj["system_name"])
+        # Alias unchanged pre-rename baselines onto their canonical B0+/B1/B2 IDs.
+        system_name = _LEGACY_SYSTEM_ALIASES.get(raw_sys, raw_sys)
         rec = TaskEvalRecord(
             question_id=str(obj["question_id"]),
             db_id=str(obj["db_id"]),
@@ -240,15 +251,16 @@ class LiveRunCheckpointer:
 
     Args:
       suite_name: Benchmark suite label ('BIRD-Dev Clean' or 'BIRD-Dev Voice').
-      system_name: Evaluated pipeline identifier ('Argus-SQL', 'B0_ZeroShotDDL').
+      system_name: Evaluated pipeline identifier ('Argus-SQL', 'B0_RawDDL').
       question_id: Unique task question identifier.
 
     Returns:
       Cached `TaskEvalRecord` if present, otherwise `None`.
     """
+    canon_sys = _LEGACY_SYSTEM_ALIASES.get(system_name, system_name)
     # Acquire lock so concurrent worker threads read a consistent snapshot.
     with self._lock:
-      return self._cache.get((suite_name, system_name, question_id))
+      return self._cache.get((suite_name, canon_sys, question_id))
 
   def record(
       self, suite_name: str, system_name: str, rec: TaskEvalRecord
@@ -300,8 +312,7 @@ class LiveRunCheckpointer:
     """Evicts cached evaluations for `system_name` and compacts disk JSONL.
 
     Enables rapid iterative re-evaluation of `Argus-SQL` (`--recompute-argus`)
-    against frozen `B0..B3` baseline checkpoints without repeating baseline
-    LLM calls or reading stale `Argus-SQL` predictions.
+    or specific baselines (`--recompute-systems`) against cached checkpoints.
 
     Args:
       system_name: Pipeline identifier to evict (e.g., `'Argus-SQL'`).
@@ -309,9 +320,10 @@ class LiveRunCheckpointer:
     Returns:
       Number of evicted `(suite_name, system_name, question_id)` records.
     """
+    target_sys = _LEGACY_SYSTEM_ALIASES.get(system_name, system_name)
     # Hold lock across cache eviction and atomic temp-file compaction.
     with self._lock:
-      drop_keys = [k for k in self._cache if k[1] == system_name]
+      drop_keys = [k for k in self._cache if k[1] == target_sys]
       if not drop_keys:
         return 0
       for key in drop_keys:
@@ -324,8 +336,10 @@ class LiveRunCheckpointer:
             continue
           try:
             parsed = json.loads(raw_ln)
-            if isinstance(parsed, dict) and parsed.get("system_name") == system_name:
-              continue
+            if isinstance(parsed, dict):
+              ln_sys = str(parsed.get("system_name", ""))
+              if _LEGACY_SYSTEM_ALIASES.get(ln_sys, ln_sys) == target_sys:
+                continue
           except json.JSONDecodeError:
             continue
           kept_lines.append(raw_ln + "\n")

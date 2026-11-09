@@ -38,9 +38,11 @@ class LLMCompletionResponse:
     request_id: Correlation identifier matching `LLMCompletionRequest`.
     sql_text: Extracted executable SQL query string.
     raw_text: Raw model output text prior to code-fence extraction.
-    prompt_tokens: Input token count reported or estimated.
-    completion_tokens: Output token count reported or estimated.
+    prompt_tokens: Input token count billed on this call (`0` when `from_cache`).
+    completion_tokens: Output token count billed on this call (`0` when cached).
     from_cache: True when served from the SHA-256 prompt deduplication cache.
+    cached_prompt_tokens: Underlying prompt tokens when `from_cache=True`.
+    cached_completion_tokens: Underlying completion tokens when `from_cache=True`.
   """
 
   request_id: str
@@ -49,6 +51,29 @@ class LLMCompletionResponse:
   prompt_tokens: int
   completion_tokens: int
   from_cache: bool = False
+  cached_prompt_tokens: int = 0
+  cached_completion_tokens: int = 0
+
+  @property
+  def effective_prompt_tokens(self) -> int:
+    """Returns standalone input prompt tokens even when served from cache."""
+    # Fall back to `cached_prompt_tokens` when cross-system dedup hits cache.
+    if self.from_cache and self.cached_prompt_tokens > 0:
+      return self.cached_prompt_tokens
+    return self.prompt_tokens
+
+  @property
+  def effective_completion_tokens(self) -> int:
+    """Returns standalone output completion tokens even when served from cache."""
+    # Fall back to `cached_completion_tokens` on cross-system SHA-256 cache hits.
+    if self.from_cache and self.cached_completion_tokens > 0:
+      return self.cached_completion_tokens
+    return self.completion_tokens
+
+  @property
+  def logical_tokens(self) -> int:
+    """Returns total standalone prompt + completion tokens for a candidate."""
+    return self.effective_prompt_tokens + self.effective_completion_tokens
 
 
 # Hexagonal port decoupling pipelines from specific cloud/local LLM SDKs.

@@ -2,10 +2,11 @@
 
 Supports two reproducible modes:
 1. `--mode diagnostic`: Materializes the clean-room Mini-BIRD & Voice-BIRD
-   databases in a temporary directory, runs B0..B3 + Argus-SQL + 5 ablations,
-   and writes LaTeX tables + JSON metrics.
-2. `--mode bird`: Evaluates B0..B3 + Argus-SQL on an external public BIRD-SQL
-   directory (`dev.json` / `mini_dev_sqlite.json`) using a live HTTPS LLM API.
+   databases in a temporary directory, runs controlled operator baselines
+   (`B0_RawDDL`..`B4_LLMJudge`) + `Argus-SQL` + 5 ablations, and writes LaTeX
+   tables + JSON metrics.
+2. `--mode bird`: Evaluates `B0_RawDDL`..`B4_LLMJudge` + `Argus-SQL` on an
+   external public BIRD-SQL split (`dev.json` / `mini_dev_sqlite.json`).
 """
 
 import argparse
@@ -58,7 +59,7 @@ def _write_confined_output(
 def _print_suite_summaries(
     clean_rep: BenchmarkSuiteReport, voice_rep: BenchmarkSuiteReport
 ) -> None:
-  """Prints Clean/Voice leaderboard rows and paired McNemar p-value."""
+  """Prints Clean/Voice leaderboard rows and paired McNemar p-values."""
   # Emit Clean text split accuracy, R-VES, and mean token metrics first.
   for s in clean_rep.summaries:
     sys.stdout.write(
@@ -71,20 +72,66 @@ def _print_suite_summaries(
         f"[Voice] {s.system_name:26s} | EX={s.ex_overall:5.1f}% | "
         f"R-VES={s.r_ves_overall:5.1f} | Tok={s.mean_tokens:5.0f}\n"
     )
-  # Compute exact two-sided McNemar test whenever both B3 and Argus-SQL ran.
+  # Compute exact two-sided McNemar p-values against B3 and B4 baselines.
   clean_recs = dict(clean_rep.records_by_system)
   voice_recs = dict(voice_rep.records_by_system)
-  if "B3_CHESSValueConsistency" in clean_recs and "Argus-SQL" in clean_recs:
-    joint_b3 = (
-        clean_recs["B3_CHESSValueConsistency"]
-        + voice_recs["B3_CHESSValueConsistency"]
-    )
-    joint_argus = clean_recs["Argus-SQL"] + voice_recs["Argus-SQL"]
-    p_joint = compute_mcnemar_p_value(joint_b3, joint_argus)
-    sys.stdout.write(
-        f"[Stats] Paired McNemar p-value (Argus-SQL vs B3, N={len(joint_argus)}):"
-        f" {p_joint:.2e}\n"
-    )
+  if "Argus-SQL" not in clean_recs:
+    return
+  joint_argus = clean_recs["Argus-SQL"] + voice_recs["Argus-SQL"]
+  for base_id in ("B3_ValueMajorityVote", "B4_LLMJudge"):
+    if base_id in clean_recs and base_id in voice_recs:
+      joint_base = clean_recs[base_id] + voice_recs[base_id]
+      p_joint = compute_mcnemar_p_value(joint_base, joint_argus)
+      p_voice = compute_mcnemar_p_value(
+          voice_recs[base_id], voice_recs["Argus-SQL"]
+      )
+      sys.stdout.write(
+          f"[Stats] McNemar (Argus-SQL vs {base_id}): "
+          f"Joint={p_joint:.2e} (N={len(joint_argus)}), Voice={p_voice:.2e}\n"
+      )
+
+
+def _build_arg_parser() -> argparse.ArgumentParser:
+  """Constructs CLI argument parser for diagnostic and live BIRD modes."""
+  # Configure mode selection, BIRD split locations, and provider flags.
+  parser = argparse.ArgumentParser(
+      description="Argus-SQL Comparative Benchmark & Ablation Runner."
+  )
+  parser.add_argument("--mode", choices=("diagnostic", "bird"), default="diagnostic")
+  # Public BIRD-SQL / Mini-Dev dataset path and split filename parameters.
+  parser.add_argument("--bird-dir", type=pathlib.Path, default=None)
+  parser.add_argument("--questions-filename", type=str, default="dev.json")
+  parser.add_argument("--tables-filename", type=str, default="dev_tables.json")
+  parser.add_argument("--databases-subdir", type=str, default="dev_databases")
+  # Live LLM adapter routing (Vertex AI / Gemini Enterprise vs. OpenAI/vLLM).
+  parser.add_argument("--provider", choices=("auto", "openai", "vertex"), default="auto")
+  parser.add_argument("--gcp-project", type=str, default=None)
+  parser.add_argument("--gcp-location", type=str, default=None)
+  parser.add_argument("--model", type=str, default="auto")
+  parser.add_argument(
+      "--endpoint-url", type=str, default="https://api.openai.com/v1/chat/completions"
+  )
+  # Execution subsetting, checkpoint invalidation, and confined output paths.
+  parser.add_argument("--only-argus", action="store_true")
+  parser.add_argument("--stratified", action="store_true")
+  parser.add_argument(
+      "--checkpoint-dir", type=pathlib.Path, default=pathlib.Path("results/live_runs")
+  )
+  # Selective checkpoint eviction avoids re-billing unchanged baseline runs.
+  parser.add_argument("--recompute-argus", action="store_true")
+  parser.add_argument("--recompute-systems", type=str, default="")
+  parser.add_argument("--fresh-checkpoint", action="store_true")
+  # Confined output directories for LaTeX tables, JSON metrics, and bundles.
+  parser.add_argument(
+      "--latex-out-dir", type=pathlib.Path, default=pathlib.Path("paper/tables")
+  )
+  parser.add_argument("--json-out-dir", type=pathlib.Path, default=pathlib.Path("results"))
+  parser.add_argument(
+      "--feedback-out-dir", type=pathlib.Path, default=pathlib.Path("results/feedback")
+  )
+  parser.add_argument("--limit", type=int, default=0)
+  parser.add_argument("--task-concurrency", type=int, default=8)
+  return parser
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -96,96 +143,8 @@ def main(argv: Sequence[str] | None = None) -> int:
   Returns:
     Exit code 0 upon completion.
   """
-  # Configure benchmark mode, dataset location, and provider transport flags.
-  parser = argparse.ArgumentParser(
-      description="Argus-SQL Comparative Benchmark & Ablation Runner."
-  )
-  parser.add_argument(
-      "--mode", choices=("diagnostic", "bird"), default="diagnostic",
-      help="Run hermetic Mini-BIRD diagnostic suite or live public BIRD split.",
-  )
-  # Public BIRD-SQL / Mini-Dev dataset path and split filename parameters.
-  parser.add_argument(
-      "--bird-dir", type=pathlib.Path, default=None,
-      help="Path to downloaded public BIRD-SQL dev or mini-dev directory.",
-  )
-  parser.add_argument(
-      "--questions-filename", type=str, default="dev.json",
-      help="Questions JSON/JSONL file (`dev.json` or `mini_dev_sqlite.json`).",
-  )
-  parser.add_argument(
-      "--tables-filename", type=str, default="dev_tables.json",
-      help="Schema metadata JSON file (`dev_tables.json`).",
-  )
-  parser.add_argument(
-      "--databases-subdir", type=str, default="dev_databases",
-      help="Relative subdirectory under `--bird-dir` holding `<db>/<db>.sqlite`.",
-  )
-  # Live LLM adapter routing (Vertex AI / Gemini Enterprise vs. OpenAI/vLLM).
-  parser.add_argument(
-      "--provider", choices=("auto", "openai", "vertex"), default="auto",
-      help="Live LLM transport (`auto` uses Vertex AI when GCP env is set).",
-  )
-  parser.add_argument(
-      "--gcp-project", type=str, default=None,
-      help="Google Cloud project ID for Vertex AI / Gemini Enterprise.",
-  )
-  parser.add_argument(
-      "--gcp-location", type=str, default=None,
-      help="Vertex AI location (`global` by default or regional slug).",
-  )
-  parser.add_argument(
-      "--model", type=str, default="auto",
-      help="Model identifier (`auto` selects `gemini-3.7-flash` or `gpt-4o-mini`).",
-  )
-  parser.add_argument(
-      "--endpoint-url", type=str,
-      default="https://api.openai.com/v1/chat/completions",
-      help="HTTPS or localhost OpenAI-compatible chat completions endpoint.",
-  )
-  # Execution subsetting, concurrency, and confined LaTeX/JSON output paths.
-  parser.add_argument(
-      "--only-argus", action="store_true",
-      help="Evaluate only Argus-SQL (skip B0..B3 baselines) for fast smoke runs.",
-  )
-  parser.add_argument(
-      "--stratified", action="store_true",
-      help="Select a difficulty-balanced round-robin slice across all databases.",
-  )
-  parser.add_argument(
-      "--checkpoint-dir", type=pathlib.Path, default=pathlib.Path("results/live_runs"),
-      help="Directory for incremental per-task JSONL checkpoints (`results/live_runs`).",
-  )
-  parser.add_argument(
-      "--recompute-argus", action="store_true",
-      help="Evict cached Argus-SQL entries so updated Argus-SQL runs fresh against B0..B3.",
-  )
-  parser.add_argument(
-      "--fresh-checkpoint", action="store_true",
-      help="Clear existing checkpoint file before running to re-evaluate all systems.",
-  )
-  parser.add_argument(
-      "--latex-out-dir", type=pathlib.Path, default=pathlib.Path("paper/tables"),
-      help="Directory where generated `.tex` booktabs tables are saved.",
-  )
-  parser.add_argument(
-      "--json-out-dir", type=pathlib.Path, default=pathlib.Path("results"),
-      help="Directory where structured JSON benchmark reports are saved.",
-  )
-  parser.add_argument(
-      "--feedback-out-dir", type=pathlib.Path,
-      default=pathlib.Path("results/feedback"),
-      help="Directory where sanitized CI/CD feedback bundles & triage reports go.",
-  )
-  parser.add_argument(
-      "--limit", type=int, default=0,
-      help="Optional cap on number of BIRD tasks evaluated (0 = all).",
-  )
-  parser.add_argument(
-      "--task-concurrency", type=int, default=8,
-      help="Parallel task workers in `--mode bird` (bounded by LLM pool).",
-  )
-  args = parser.parse_args(argv)
+  # Parse CLI arguments from `argv` or `sys.argv[1:]`.
+  args = _build_arg_parser().parse_args(argv)
 
   # Hermetic Clean-Room Diagnostic Mode (`Mini-BIRD` + `Voice-BIRD` splits).
   if args.mode == "diagnostic":
@@ -200,7 +159,7 @@ def main(argv: Sequence[str] | None = None) -> int:
       clean_tasks = build_mini_bird_clean_tasks()
       voice_tasks = build_voice_bird_tasks()
 
-      # 1. Run B0..B3 vs Argus-SQL comparative progression.
+      # 1. Run controlled operator baselines (B0..B4) vs Argus-SQL.
       main_pipes = build_main_systems(synth, sandbox)
       main_clean = run_benchmark_suite(
           "Mini-BIRD Clean", clean_tasks, main_pipes, schemas, sqlite_paths, sandbox
@@ -225,7 +184,7 @@ def main(argv: Sequence[str] | None = None) -> int:
           caption=(
               "Controlled diagnostic evaluation on Mini-BIRD (24 clean relational "
               "queries) and Voice-BIRD (24 spoken ASR-perturbed utterances) across "
-              "progressive NL2SQL system architectures."
+              "controlled backbone-matched operator baselines (B0--B4) and Argus-SQL."
           ),
           label="tab:diagnostic_main",
       )
@@ -249,7 +208,7 @@ def main(argv: Sequence[str] | None = None) -> int:
           "diagnostic_benchmark.json",
           serialize_reports_to_json((main_clean, main_voice, abl_clean, abl_voice)),
       )
-      # Print final summary table and exact paired McNemar statistical test.
+      # Print final summary table and exact paired McNemar statistical tests.
       _print_suite_summaries(main_clean, main_voice)
     return 0
 
@@ -269,7 +228,7 @@ def main(argv: Sequence[str] | None = None) -> int:
       databases_subdir=args.databases_subdir,
   )
   # Filter to materialized `.sqlite` files BEFORE slicing `--limit` so partial
-  # BIRD downloads or stratified slices evaluate across available databases.
+  # downloads or stratified slices evaluate across available databases.
   tasks = tuple(t for t in tasks if t.db_id in sqlite_paths)
   if args.limit > 0:
     tasks = (
@@ -307,10 +266,14 @@ def main(argv: Sequence[str] | None = None) -> int:
       stratified=args.stratified,
   )
   checkpointer = LiveRunCheckpointer(ckpt_path)
+  # Apply full reset or selective system cache eviction prior to execution.
   if args.fresh_checkpoint:
     checkpointer.clear_all()
-  elif args.recompute_argus:
-    checkpointer.invalidate_system("Argus-SQL")
+  else:
+    if args.recompute_argus:
+      checkpointer.invalidate_system("Argus-SQL")
+    for sys_id in (s.strip() for s in args.recompute_systems.split(",") if s.strip()):
+      checkpointer.invalidate_system(sys_id)
 
   # Support `--only-argus` for rapid low-token smoke checks on live endpoints.
   pipes: tuple[NL2SQLPipeline, ...] = (

@@ -1,4 +1,4 @@
-"""End-to-end integration tests comparing B0..B3 baselines and Argus-SQL."""
+"""End-to-end integration tests comparing B0..B4 baselines and Argus-SQL."""
 
 import pathlib
 import sqlite3
@@ -16,7 +16,13 @@ from argus_sql.linking.value_retriever import CellValueRetriever
 from argus_sql.pipelines.argus_pipeline import ArgusSQLPipeline
 from argus_sql.pipelines.baseline_pipelines import CHESSValueConsistencyPipeline
 from argus_sql.pipelines.baseline_pipelines import DINDecomposedPipeline
+from argus_sql.pipelines.baseline_pipelines import EnrichedMDDLPipeline
+from argus_sql.pipelines.baseline_pipelines import ExecRefinerPipeline
+from argus_sql.pipelines.baseline_pipelines import LLMJudgePipeline
+from argus_sql.pipelines.baseline_pipelines import LexicalCoTPipeline
 from argus_sql.pipelines.baseline_pipelines import MACRefinerPipeline
+from argus_sql.pipelines.baseline_pipelines import RawDDLPipeline
+from argus_sql.pipelines.baseline_pipelines import ValueMajorityVotePipeline
 from argus_sql.pipelines.baseline_pipelines import ZeroShotDDLPipeline
 from argus_sql.sandbox.sqlite_sandbox import SQLiteReadOnlySandbox
 from argus_sql.sandbox.types import SandboxPolicy
@@ -101,6 +107,12 @@ class ComparativePipelinesTest(unittest.TestCase):
 
   def test_argus_outperforms_baselines_on_spoken_bridge_ratio_task(self) -> None:
     """Spoken query needing bridge `schools` + `'California'` + REAL division."""
+    # Verify legacy class aliases resolve to canonical operator baseline classes.
+    self.assertIs(ZeroShotDDLPipeline, EnrichedMDDLPipeline)
+    self.assertIs(DINDecomposedPipeline, LexicalCoTPipeline)
+    self.assertIs(MACRefinerPipeline, ExecRefinerPipeline)
+    self.assertIs(CHESSValueConsistencyPipeline, ValueMajorityVotePipeline)
+
     # Create isolated SQLite database and shared read-only sandbox + 3-gram index.
     with tempfile.TemporaryDirectory() as tmp:
       root = pathlib.Path(tmp)
@@ -128,14 +140,15 @@ class ComparativePipelinesTest(unittest.TestCase):
       gold_out = sandbox.execute(db_file, task.gold_sql)
       self.assertTrue(gold_out.succeeded)
 
-      # Evaluate B0, B1, B2, B3, and Argus-SQL on the exact same task.
+      # Evaluate B0_RawDDL, B0+_EnrichedMDDL, B1..B4, and Argus-SQL on same task.
       for baseline in (
-          ZeroShotDDLPipeline(synth, sandbox),
-          DINDecomposedPipeline(synth, sandbox),
-          MACRefinerPipeline(synth, sandbox),
-          CHESSValueConsistencyPipeline(synth, sandbox),
+          RawDDLPipeline(synth, sandbox),
+          EnrichedMDDLPipeline(synth, sandbox),
+          LexicalCoTPipeline(synth, sandbox),
+          ExecRefinerPipeline(synth, sandbox),
+          ValueMajorityVotePipeline(synth, sandbox),
+          LLMJudgePipeline(synth, sandbox),
       ):
-        # Confirm every baseline emits a syntactically non-empty SQL string.
         pred = baseline.predict(task, schema, db_file, retriever)
         self.assertTrue(pred.final_sql)
 
@@ -145,6 +158,121 @@ class ComparativePipelinesTest(unittest.TestCase):
       argus_out = sandbox.execute(db_file, argus_pred.final_sql)
       # Argus-SQL must recover `schools` bridge, `'California'`, and `0.4`!
       self.assertEqual(argus_out.result_signature, gold_out.result_signature)
+
+  def test_b4_judge_short_circuits_rescues_b3_and_trails_argus_on_correlated_bugs(
+      self,
+  ) -> None:
+    """`B4_LLMJudge` rescues `B3` on 1/3 REAL split, yet fails `0/3` traps."""
+    from collections.abc import Sequence
+    from argus_sql.adapters.types import LLMCompletionRequest
+    from argus_sql.adapters.types import LLMCompletionResponse
+
+    with tempfile.TemporaryDirectory() as tmp:
+      root = pathlib.Path(tmp)
+      schema, db_file = self._setup_mini_schools_db(root)
+      sandbox = SQLiteReadOnlySandbox(SandboxPolicy(allowed_db_root=root))
+      synth = SchemaGuidedDiagnosticSynthesizer()
+      retriever = CellValueRetriever.from_schema_and_sqlite(schema, db_file)
+
+      # 1. Agreement short-circuit: simple count produces 1 cluster -> 0 judge calls.
+      simple_task = NLQueryTask(
+          "s_agree", "schools", "How many districts are in state California?"
+      )
+      b4 = LLMJudgePipeline(synth, sandbox)
+      agree_pred = b4.predict(simple_task, schema, db_file, retriever)
+      # Metadata must confirm that no extra Judge completion was dispatched.
+      self.assertIn(("judge_invoked", "False"), agree_pred.metadata)
+
+      # 2. Disagreement rescue: B3 picks truncated `0` (2/3 votes), whereas B4
+      #    invokes the execution-preview Judge and selects Option B (`0.4`).
+      ratio_task = NLQueryTask(
+          "s_ratio",
+          "schools",
+          "What is the overall free meal rate in California?",
+          evidence="free meal rate = free_meals / enrollment",
+          difficulty=QueryDifficulty.CHALLENGING,
+      )
+      b3_pred = ValueMajorityVotePipeline(synth, sandbox).predict(
+          ratio_task, schema, db_file, retriever
+      )
+      b4_pred = b4.predict(ratio_task, schema, db_file, retriever)
+      # Confirm B3 succumbs to majority truncation while B4 selects REAL 0.4.
+      self.assertEqual(sandbox.execute(db_file, b3_pred.final_sql).rows, ((0,),))
+      self.assertEqual(sandbox.execute(db_file, b4_pred.final_sql).rows, ((0.4,),))
+      # Confirm B4 spent extra Judge prompt + completion tokens beyond B3's K=3.
+      self.assertIn(("judge_invoked", "True"), b4_pred.metadata)
+      self.assertGreater(b4_pred.total_tokens, b3_pred.total_tokens)
+
+      # 3. Correlated `0/3` bug: all 3 candidates omit `CAST(... AS REAL)`.
+      #    `B4_LLMJudge` has 1 wrong cluster (`Oracle@3 = 0%`), whereas
+      #    `Argus-SQL`'s 0-token algebraic repair rewrites it to `0.4`!
+      class _AllUncastMockLLM:
+        """Emits uncast integer division across all K=3 candidate strategies."""
+
+        def batch_complete(
+            self, requests: Sequence[LLMCompletionRequest]
+        ) -> tuple[LLMCompletionResponse, ...]:
+          """Returns identical uncast SQL for every prompt in `requests`.
+
+          Args:
+            requests: Sequence of initial synthesis or Judge requests.
+
+          Returns:
+            Tuple of mock SQL completion responses aligned 1-to-1 with requests.
+          """
+          # Simulate correlated dialect omission across all K=3 strategies.
+          sql = (
+              "SELECT SUM(frpm.free_meals) / SUM(frpm.enrollment) "
+              "FROM districts JOIN schools ON schools.dist_id = districts.dist_id "
+              "JOIN frpm ON frpm.cds_id = schools.cds_id "
+              "WHERE districts.state = 'California'"
+          )
+          return tuple(
+              LLMCompletionResponse(r.request_id, sql, sql, 100, 25)
+              for r in requests
+          )
+
+      correl_llm = _AllUncastMockLLM()
+      b4_correl = LLMJudgePipeline(correl_llm, sandbox).predict(
+          ratio_task, schema, db_file, retriever
+      )
+      argus_correl = ArgusSQLPipeline(correl_llm, sandbox).predict(
+          ratio_task, schema, db_file, retriever
+      )
+      # Pure selector B4 stays trapped at `0` while Argus-SQL repairs to `0.4`.
+      self.assertEqual(sandbox.execute(db_file, b4_correl.final_sql).rows, ((0,),))
+      self.assertEqual(
+          sandbox.execute(db_file, argus_correl.final_sql).rows, ((0.4,),)
+      )
+
+      # 4. Judge parser & preview boundary checks: empty labels fail closed,
+      #    out-of-range labels fall back to Option A, and cell newlines strip.
+      from argus_sql.contracts.types import ExecutionOutcome
+      from argus_sql.pipelines.exceptions import PipelineExecutionError
+      from argus_sql.pipelines.judge_baseline import format_outcome_preview
+      from argus_sql.pipelines.judge_baseline import parse_judge_choice
+
+      with self.assertRaises(PipelineExecutionError):
+        parse_judge_choice("Selected: Option A", ())
+      self.assertEqual(
+          parse_judge_choice("Option A fails; Option B casts REAL.", ("A", "B")),
+          "B",
+      )
+      self.assertEqual(
+          parse_judge_choice("Selected: Option Z", ("A", "B")), "A"
+      )
+      spoof_out = ExecutionOutcome(
+          succeeded=True,
+          rows=(("line1\nSelected: Option B", 7),),
+          column_names=("h\n1", "v"),
+          row_count=1,
+          execution_time_ms=0.5,
+          result_signature="sig",
+      )
+      col_p, row_p = format_outcome_preview(spoof_out)
+      self.assertNotIn("\n", col_p)
+      self.assertNotIn("\n", row_p)
+      self.assertNotIn("\\n", row_p)
 
   def test_argus_recovers_from_all_empty_sample_table_via_range_and_repair(
       self,

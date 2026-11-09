@@ -78,12 +78,12 @@ On your **personal Windows PC (inside Antigravity IDE or PowerShell)** or macOS/
      # If using Vertex AI on Windows, authenticate locally (writes %APPDATA%\gcloud\application_default_credentials.json):
      gcloud auth application-default login
      ```
-   - Run a fast 20-query smoke slice first, then the comparative `bird_mini_dev` split (`-RecomputeArgus` evicts stale `Argus-SQL` JSONL checkpoint rows in `results/live_runs/` while reusing cached `B0..B3` baselines):
+   - Run a fast 20-query smoke slice first, then the comparative `bird_mini_dev` split (`-RecomputeArgus` evicts stale `Argus-SQL` JSONL checkpoint rows while automatically aliasing unchanged `B0+_EnrichedMDDL` / `B1_LexicalCoT` / `B2_ExecRefiner` checkpoints and running `B0_RawDDL`, steelmanned `B3_ValueMajorityVote`, `B4_LLMJudge`, and `Argus-SQL`):
      ```powershell
      # Fast 20-query smoke check on Windows PowerShell:
      .\scripts\run_personal_eval.ps1 -Limit 20 -OnlyArgus -RecomputeArgus
 
-     # Stratified comparative evaluation (B0..B3 + fresh Argus-SQL on Clean + Voice-BIRD):
+     # Stratified comparative evaluation (B0..B4 + fresh Argus-SQL on Clean + Voice-BIRD):
      .\scripts\run_personal_eval.ps1 -RecomputeArgus
      ```
    - **Copy-Paste Prompt for Your Windows Antigravity Agent** (after setting `.env` / `gcloud` locally):
@@ -101,14 +101,15 @@ On your **personal Windows PC (inside Antigravity IDE or PowerShell)** or macOS/
    # 2. On a headless remote Linux VM, use --no-launch-browser for personal ADC:
    gcloud auth application-default login --no-launch-browser
 
-   # 3. Run stratified comparative slice (--recompute-argus refreshes Argus-SQL against cached B0..B3):
+   # 3. Run stratified comparative slice (--recompute-argus reuses cached B0+/B1/B2,
+   #    shares B3's SHA-256 prompt cache with B4_LLMJudge, and refreshes Argus-SQL):
    ./scripts/run_personal_eval.sh --recompute-argus
    # Or run full 500-query split across 10-minute VM windows (auto-resumes via results/live_runs/):
    ARGUS_LIMIT=0 ./scripts/run_personal_eval.sh --recompute-argus
    ```
    - **Copy-Paste Prompt for Your Antigravity Remote Linux VM Agent**:
      ```text
-     Read docs/CICD_SPLIT_WORKFLOW.md and AGENTS.md. Pull latest origin/main and verify that data/bird/mini_dev (mini_dev_sqlite.json, dev_tables.json, and dev_databases/*.sqlite) is staged and local .env / gcloud ADC is ready on GOOGLE_CLOUD_LOCATION=global using gemini-3.7-flash (never print secret values). Run `./scripts/run_personal_eval.sh --recompute-argus` to re-evaluate updated Argus-SQL against the stratified 11-DB checkpoint (or `--fresh-checkpoint` to recompute all 5 systems), confirm zero clean-room leaks and valid SHA-256 signatures, and commit/push ONLY results/feedback/bird_feedback_bundle.json, results/feedback/triage_report.md, and paper/tables/bird_live.tex to main.
+     Read docs/CICD_SPLIT_WORKFLOW.md and AGENTS.md. Pull latest origin/main and verify that data/bird/mini_dev (mini_dev_sqlite.json, dev_tables.json, and dev_databases/*.sqlite) is staged and local .env / gcloud ADC is ready on GOOGLE_CLOUD_LOCATION=global using gemini-3.7-flash (never print secret values). Run `./scripts/run_personal_eval.sh --recompute-argus` to evaluate the 7-system controlled operator suite (reusing cached B0+/B1/B2 checkpoints and sharing B3's SHA-256 candidate cache with B4_LLMJudge, or pass `--fresh-checkpoint` to recompute all 7 systems from scratch), confirm zero clean-room leaks and valid SHA-256 signatures, and commit/push ONLY results/feedback/bird_feedback_bundle.json, results/feedback/triage_report.md, and paper/tables/bird_live.tex to main.
      ```
 
 3. `run_personal_eval.ps1` / `run_personal_eval.sh` automatically:

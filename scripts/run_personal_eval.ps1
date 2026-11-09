@@ -32,6 +32,7 @@ param(
     [bool]$Stratified = $(if ($env:ARGUS_STRATIFIED -in @("0", "false", "False")) { $false } else { $true }),
     [switch]$OnlyArgus,
     [switch]$RecomputeArgus,
+    [string]$RecomputeSystems = $(if ($env:ARGUS_RECOMPUTE_SYSTEMS) { $env:ARGUS_RECOMPUTE_SYSTEMS } else { "" }),
     [switch]$FreshCheckpoint,
     [Parameter(ValueFromRemainingArguments = $true)]
     [string[]]$ExtraArgs = @()
@@ -152,6 +153,9 @@ try {
     }
     if (($RecomputeArgus -or ($env:ARGUS_RECOMPUTE_ARGUS -in @("1", "true", "True"))) -and ($ExtraArgs -notcontains "--recompute-argus")) {
         $EvalArgs += "--recompute-argus"
+    }
+    if ((-not [string]::IsNullOrWhiteSpace($RecomputeSystems)) -and ($ExtraArgs -notcontains "--recompute-systems")) {
+        $EvalArgs += @("--recompute-systems", $RecomputeSystems)
     }
     if (($FreshCheckpoint -or ($env:ARGUS_FRESH_CHECKPOINT -in @("1", "true", "True"))) -and ($ExtraArgs -notcontains "--fresh-checkpoint")) {
         $EvalArgs += "--fresh-checkpoint"

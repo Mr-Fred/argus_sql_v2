@@ -148,15 +148,15 @@ class ArgusSQLPipeline:
     )
     # Dispatch selected strategies concurrently via BatchLLMPort.
     resps = self._llm.batch_complete(batch_reqs)
-    total_tokens = sum(r.prompt_tokens + r.completion_tokens for r in resps)
+    total_tokens = sum(r.logical_tokens for r in resps)
 
     # Wrap raw completion strings into immutable SQLCandidate contracts.
     candidates: list[SQLCandidate] = [
         SQLCandidate(
             sql=r.sql_text,
             strategy=req.strategy_tag,
-            prompt_tokens=r.prompt_tokens,
-            completion_tokens=r.completion_tokens,
+            prompt_tokens=r.effective_prompt_tokens,
+            completion_tokens=r.effective_completion_tokens,
         )
         for req, r in zip(batch_reqs, resps, strict=True)
     ]
@@ -257,12 +257,12 @@ class ArgusSQLPipeline:
         )
         # Execute single-element batch through the unified BatchLLMPort adapter.
         rep_resp = self._llm.batch_complete((rep_req,))[0]
-        total_tokens += rep_resp.prompt_tokens + rep_resp.completion_tokens
+        total_tokens += rep_resp.logical_tokens
         rep_cand = SQLCandidate(
             sql=rep_resp.sql_text,
             strategy="argus_llm_repair",
-            prompt_tokens=rep_resp.prompt_tokens,
-            completion_tokens=rep_resp.completion_tokens,
+            prompt_tokens=rep_resp.effective_prompt_tokens,
+            completion_tokens=rep_resp.effective_completion_tokens,
         )
         rep_out = self._sandbox.execute(db_path, rep_cand.sql)
         candidates.append(rep_cand)

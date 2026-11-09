@@ -309,6 +309,8 @@ class VertexGeminiBatchClient:
                 prompt_tokens=0 if is_hit else p_tok,
                 completion_tokens=0 if is_hit else c_tok,
                 from_cache=is_hit,
+                cached_prompt_tokens=p_tok if is_hit else 0,
+                cached_completion_tokens=c_tok if is_hit else 0,
             )
         )
     return tuple(responses)

@@ -371,6 +371,28 @@ class LinkingModuleTest(unittest.TestCase):
     self.assertEqual(k12_vms, ())
     del geo_schema
 
+  def test_extract_raw_entities_steelmans_multiword_spans_without_voice_leaks(
+      self,
+  ) -> None:
+    """`extract_raw_entities` captures multi-word entities without voice rules."""
+    from argus_sql.linking.intent_canonicalizer import extract_raw_entities
+
+    clean_spans = extract_raw_entities(
+        "What is the overall free meal rate in Los Angeles for 'Magnet' schools?",
+        "Marvel Comics refers to publisher_name = 'Marvel Comics'; TR004_8_9",
+    )
+    self.assertIn("Los Angeles", clean_spans)
+    self.assertIn("Magnet", clean_spans)
+    self.assertIn("Marvel Comics", clean_spans)
+    self.assertIn("TR004_8_9", clean_spans)
+
+    # Spoken abbreviations ('la county', 'ny') must NOT expand without Stage 1.
+    spoken_spans = extract_raw_entities(
+        "uh hey tell me the overall free meal rate in la county and state ny"
+    )
+    self.assertNotIn("Los Angeles", spoken_spans)
+    self.assertNotIn("New York", spoken_spans)
+
 
 if __name__ == "__main__":
   unittest.main()

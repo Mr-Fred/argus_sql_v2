@@ -249,6 +249,8 @@ class OpenAICompatibleBatchClient:
       for req, digest in zip(requests, req_hashes, strict=True):
         raw_text, p_tok, c_tok = self._cache[digest]
         is_hit = digest in cached_hits
+        # Zero billed `prompt_tokens` on cache hits while retaining standalone
+        # `cached_*_tokens` so cross-system comparisons report true token cost.
         responses.append(
             LLMCompletionResponse(
                 request_id=req.request_id,
@@ -257,6 +259,8 @@ class OpenAICompatibleBatchClient:
                 prompt_tokens=0 if is_hit else p_tok,
                 completion_tokens=0 if is_hit else c_tok,
                 from_cache=is_hit,
+                cached_prompt_tokens=p_tok if is_hit else 0,
+                cached_completion_tokens=c_tok if is_hit else 0,
             )
         )
     return tuple(responses)

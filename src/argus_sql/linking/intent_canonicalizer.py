@@ -51,8 +51,22 @@ _IMPERATIVE_RANK_RE = re.compile(
 )
 
 
-def _extract_entity_candidates(question: str, evidence: str) -> tuple[str, ...]:
-  """Extracts quoted literals, proper nouns, domain IDs, and spoken codes."""
+def extract_raw_entities(question: str, evidence: str = "") -> tuple[str, ...]:
+  """Extracts surface entity spans without Stage 1 voice/ASR canonicalization.
+
+  Extracts quoted literals, multi-word capitalized proper nouns, alphanumeric
+  domain identifiers, hyphen/adverb status phrases, and prepositional n-grams
+  so non-voice value-grounding baselines (`B3_ValueMajorityVote`, `B4_LLMJudge`)
+  are evaluated fairly on multi-word entities without leaking spoken shorthand
+  expansions (`_SPOKEN_EXPANSIONS`) or ASR casing normalization.
+
+  Args:
+    question: User natural language question or raw ASR transcript.
+    evidence: Optional external domain knowledge / formula specification.
+
+  Returns:
+    Tuple of up to 16 candidate entity/literal spans in appearance order.
+  """
   spans: list[str] = []
   combined = f"{question} {evidence}".strip()
 
@@ -121,6 +135,13 @@ def _extract_entity_candidates(question: str, evidence: str) -> tuple[str, ...]:
       cand = " ".join(cand_words)
       if cand not in spans:
         spans.append(cand)
+
+  return tuple(spans[:16])
+
+
+def _extract_entity_candidates(question: str, evidence: str) -> tuple[str, ...]:
+  """Extracts surface entity spans plus Stage 1 spoken geographic expansions."""
+  spans = list(extract_raw_entities(question, evidence))
 
   # 6. Add canonical forms for common spoken geographic abbreviations.
   lower_q = question.lower()

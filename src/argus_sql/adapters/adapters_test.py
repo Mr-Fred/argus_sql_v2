@@ -159,7 +159,8 @@ class AdaptersModuleTest(unittest.TestCase):
     self.assertEqual(token_calls, 1)
     self.assertEqual(len(out), 2)
     self.assertEqual(out[0].sql_text, "SELECT COUNT(*) FROM schools")
-    # Subsequent batch call hits the SHA-256 cache with 0 billed tokens.
+    # Subsequent batch call hits the SHA-256 cache with 0 billed tokens while
+    # preserving `logical_tokens == 180` for standalone baseline comparisons.
     with mock.patch.object(
         client, "_post_generate_once", return_value=sample_body
     ) as post_mock_cached:
@@ -167,6 +168,25 @@ class AdaptersModuleTest(unittest.TestCase):
     self.assertEqual(post_mock_cached.call_count, 0)
     self.assertTrue(cached_out[0].from_cache)
     self.assertEqual(cached_out[0].prompt_tokens, 0)
+    self.assertEqual(cached_out[0].logical_tokens, 180)
+
+    # Deterministic synthesizer `llm_judge` mode prefers REAL ratio over `[(0,)]`.
+    judge_prompt = (
+        "Question: What is the overall free meal rate?\n"
+        "External Evidence: free_meals / enrollment\n\n"
+        "Option A (support: 2/3 candidates):\n"
+        "SQL: SELECT SUM(free_meals) / SUM(enrollment) FROM frpm\n"
+        "Columns: ['rate'] | Row Count: 1\n"
+        "Sample Rows: [(0,)]\n\n"
+        "Option B (support: 1/3 candidates):\n"
+        "SQL: SELECT CAST(SUM(free_meals) AS REAL) / NULLIF(SUM(enrollment), 0) FROM frpm\n"
+        "Columns: ['rate'] | Row Count: 1\n"
+        "Sample Rows: [(0.4,)]\n"
+    )
+    judge_resp = SchemaGuidedDiagnosticSynthesizer().batch_complete(
+        (LLMCompletionRequest("j1", "judge", judge_prompt, strategy_tag="llm_judge"),)
+    )[0]
+    self.assertEqual(judge_resp.raw_text, "Selected: Option B")
 
   def test_dotenv_defaults_and_provider_auto_routing(self) -> None:
     """`.env` configures Vertex, OpenAI key, and loopback routing safely."""

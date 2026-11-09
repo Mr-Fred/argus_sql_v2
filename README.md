@@ -10,11 +10,11 @@
 
 As conversational and voice-driven interfaces become a primary way humans interact with software, **Natural Language to SQL (NL2SQL)** is positioned to bridge spontaneous human intent and terabyte-scale analytical databases. However, existing leaderboard pipelines suffer from an acute **accuracy–latency–robustness trilemma**:
 
-- Single-pass zero-shot or lexical-pruning baselines (`B0`, `B1`) break on dirty database strings, multi-hop foreign-key bridge tables, and spoken ASR disfluencies.
-- Execution-error refiners (`B2`, e.g., MAC-SQL) are blind to **silent SQLite semantic bugs** such as integer-division truncation (`SUM(a) / SUM(b) -> 0`) and `NULL`-first ascending `ORDER BY ... LIMIT 1` queries.
-- Brute-force self-consistency ensembles (`B3`, $K=20$) burn massive token budgets and still lose whenever $>50\%$ of samples share a systematic dialect bug.
+- Single-pass raw or lexical-pruning operator baselines (`B0_RawDDL`, `B0+_EnrichedMDDL`, `B1_LexicalCoT`) break on dirty database strings, multi-hop foreign-key bridge tables, and spoken ASR disfluencies.
+- Execution-error refiners (`B2_ExecRefiner`) are blind to **silent SQLite semantic bugs** such as integer-division truncation (`SUM(a) / SUM(b) -> 0`) and `NULL`-first ascending `ORDER BY ... LIMIT 1` queries.
+- Unweighted self-consistency ensembles (`B3_ValueMajorityVote`) lose whenever $>50\%$ of samples share a dialect bug, while extra-call execution-preview LLM judges (`B4_LLMJudge`, *MCS-SQL / CHESS* selector style) add sequential latency/tokens and remain bounded by `Oracle@K` whenever spoken ASR drift or correlated bugs affect all $K$ candidates.
 
-**Argus-SQL** systematically implements, compares, and recombines modular NL2SQL operators into a fast, voice-ready four-stage architecture:
+**Argus-SQL** systematically isolates, compares, and recombines modular NL2SQL operators under a single controlled backbone into a fast, voice-ready four-stage architecture:
 
 1. **Voice & Intent Canonicalizer (`linking/asr_normalizer.py`, `linking/intent_canonicalizer.py`)**: Strips ASR disfluencies/stutters, normalizes spoken cardinals (`"top five"` -> `top 5`), restores multi-sentence capitalization, terminal punctuation, and `evidence`-grounded entity/code casing (`TR004_8_9`, `Marvel Comics`, `DC`), and estimates projection arity across `? Show` / `? Indicate` follow-up sentences, imperative `Rank X by Y` queries (`3`), and `calculation =` single-column locks.
 2. **Hierarchy-Aware 3-Gram Cell Value Index, `MIN..MAX` Domain Ranges & Implicit/Junction FK Closure (`linking/value_retriever.py`, `linking/schema_graph.py`, `linking/fk_schema_linker.py`, `evaluation/bird_metadata.py`)**: Grounds messy string cells and 2–3 character domain codes in `< 1 ms`, suppresses unquoted column-qualifier (`(K-12)`) and schema-word prefix noise plus high-cardinality (`City` / `MailCity`) shadows when a canonical low-cardinality dimension (`County`) matches the identical string, hydrates batched read-only `MIN..MAX` temporal/numeric domain bounds (`range: '2012-08-23'..'2012-08-26'`), retains 100% of columns on tables up to 50 columns, and recovers explicit, implicit PK-matched, and M:N junction bridge tables (`99.8%+` table recall and `100%` column recall across `bird_mini_dev`).
@@ -25,13 +25,13 @@ As conversational and voice-driven interfaces become a primary way humans intera
 
 ### Live Public `BIRD Mini-Dev` Evaluation (`gemini-3.7-flash`, $N = 110$ Stratified Across All 11 Databases)
 
-Evaluated across `1,100` total pipeline runs (`110` Clean + `110` spoken `Voice-BIRD` queries; `37` Simple, `37` Moderate, `36` Challenging; SHA-256 bundle `f4419f770134b474...` in `results/feedback/bird_feedback_bundle.json`):
+Evaluated across `1,100` total pipeline runs (`110` Clean + `110` spoken `Voice-BIRD` queries; `37` Simple, `37` Moderate, `36` Challenging; SHA-256 bundle `f4419f770134b474...` in `results/feedback/bird_feedback_bundle.json`, showing the controlled operator IDs recorded at commit `6d25c8f` where `B0_ZeroShotDDL` = profiler-enriched `B0+_EnrichedMDDL`):
 
-| System | Simple EX | Mod. EX | Chall. EX | Clean EX (%) | Clean R-VES | Voice EX (%) | Mean Tokens |
+| Controlled Operator System | Simple EX | Mod. EX | Chall. EX | Clean EX (%) | Clean R-VES | Voice EX (%) | Mean Tokens |
 | :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
-| `B0_ZeroShotDDL` | 81.1 | 75.7 | 61.1 | 72.7 | 73.0 | **73.6** | 3647 |
-| `B1_DINDecomposed` | **83.8** | 75.7 | 58.3 | 72.7 | 73.6 | 70.9 | 3632 |
-| `B2_MACRefiner` | **83.8** | **81.1** | 55.6 | 73.6 | 73.6 | 70.9 | 2889 |
+| `B0_ZeroShotDDL` (`B0+_EnrichedMDDL`) | 81.1 | 75.7 | 61.1 | 72.7 | 73.0 | **73.6** | 3647 |
+| `B1_DINDecomposed` (`B1_LexicalCoT`) | **83.8** | 75.7 | 58.3 | 72.7 | 73.6 | 70.9 | 3632 |
+| `B2_MACRefiner` (`B2_ExecRefiner`) | **83.8** | **81.1** | 55.6 | 73.6 | 73.6 | 70.9 | 2889 |
 | `B3_CHESSValueConsistency` | 78.4 | 78.4 | 55.6 | 70.9 | 71.6 | 70.9 | 10878 |
 | **`Argus-SQL` (Ours)** | 81.1 | 78.4 | **63.9** | **74.5** | **75.2** | 71.8 | 10985 |
 
@@ -54,23 +54,25 @@ PYTHONPATH=src python3 -m argus_sql.guardrails.cli --verify-all
 PYTHONPATH=src python3 -m unittest discover -s src -p "*_test.py" -v
 ```
 
-### 3. Reproduce Comparative & Leave-One-Out Ablation Tables
+### 3. Reproduce Controlled Operator & Leave-One-Out Ablation Tables
 
-Runs `B0_ZeroShotDDL`, `B1_DINDecomposed`, `B2_MACRefiner`, `B3_CHESSValueConsistency`, `Argus-SQL`, and 5 leave-one-out component ablations across 24 clean `Mini-BIRD` queries and 24 spoken `Voice-BIRD` utterances, exporting `paper/tables/*.tex` and `results/diagnostic_benchmark.json`:
+Runs the 6 controlled backbone-matched operator baselines (`B0_RawDDL`, `B0+_EnrichedMDDL`, `B1_LexicalCoT`, `B2_ExecRefiner`, steelmanned `B3_ValueMajorityVote`, `B4_LLMJudge`), `Argus-SQL`, and 5 leave-one-out component ablations across 24 clean `Mini-BIRD` queries and 24 spoken `Voice-BIRD` utterances, exporting `paper/tables/*.tex` and `results/diagnostic_benchmark.json`:
 
 ```bash
 PYTHONPATH=src python3 -m argus_sql.evaluation.cli --mode diagnostic
 ```
 
-| System | Simple EX | Mod. EX | Chall. EX | Clean EX (%) | Clean R-VES | Voice EX (%) | Mean Tokens |
+| Controlled Operator System | Simple EX | Mod. EX | Chall. EX | Clean EX (%) | Clean R-VES | Voice EX (%) | Mean Tokens |
 | :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
-| `B0_ZeroShotDDL` | 75.0 | 37.5 | 0.0 | 37.5 | 37.5 | 16.7 | 568 |
-| `B1_DINDecomposed` | 100.0 | 25.0 | 0.0 | 41.7 | 41.7 | 25.0 | 676 |
-| `B2_MACRefiner` | 100.0 | 37.5 | 0.0 | 45.8 | 45.8 | 25.0 | 677 |
-| `B3_CHESSValueConsistency` | 100.0 | 62.5 | 0.0 | 54.2 | 54.2 | 41.7 | 1966 |
+| `B0_RawDDL` | 75.0 | 37.5 | 0.0 | 37.5 | 37.5 | 16.7 | 553 |
+| `B0+_EnrichedMDDL` | 75.0 | 37.5 | 0.0 | 37.5 | 37.5 | 16.7 | 568 |
+| `B1_LexicalCoT` | 100.0 | 25.0 | 0.0 | 41.7 | 41.7 | 25.0 | 676 |
+| `B2_ExecRefiner` | 100.0 | 37.5 | 0.0 | 45.8 | 45.8 | 25.0 | 677 |
+| `B3_ValueMajorityVote` | 100.0 | 62.5 | 0.0 | 54.2 | 54.2 | 41.7 | 1984 |
+| `B4_LLMJudge` | 100.0 | 100.0 | 100.0 | 100.0 | 100.0 | 70.8 | 2204 |
 | **`Argus-SQL` (Ours)** | **100.0** | **100.0** | **100.0** | **100.0** | **100.0** | **100.0** | **1792** |
 
-> Paired two-sided exact McNemar test (`Argus-SQL` vs. `B3_CHESSValueConsistency`, $N = 48$ Clean + Voice queries): $p = 5.96 \times 10^{-8}$.
+> Paired two-sided exact McNemar tests ($N = 48$ Clean + Voice queries): `Argus-SQL` vs. `B3_ValueMajorityVote` $p = 5.96 \times 10^{-8}$; `Argus-SQL` vs. `B4_LLMJudge` $p = 1.56 \times 10^{-2}$ (`1,792` vs. `2,204` tokens, `-18.7%`).
 
 ### 4. Split-Environment CI/CD & Live Public BIRD-SQL Evaluation
 
@@ -106,7 +108,7 @@ PYTHONPATH=src python3 -m argus_sql.evaluation.cli --mode diagnostic
   # Edit `.env` (set GOOGLE_CLOUD_PROJECT + run `gcloud auth application-default login`,
   # OR set ARGUS_LLM_API_KEY in `.env`), then run a 20-query smoke slice or full split:
   .\scripts\run_personal_eval.ps1 -Limit 20 -OnlyArgus
-  # Full stratified B0..B3 + Argus-SQL evaluation (or -RecomputeArgus after code updates):
+  # Full stratified B0..B4 + Argus-SQL evaluation (or -RecomputeArgus after code updates):
   .\scripts\run_personal_eval.ps1 -RecomputeArgus
   ```
 
@@ -116,7 +118,7 @@ PYTHONPATH=src python3 -m argus_sql.evaluation.cli --mode diagnostic
   cp config/personal_env.example .env
   # On a headless Linux VM, authenticate via `gcloud auth application-default login --no-launch-browser`
   ARGUS_LIMIT=20 ./scripts/run_personal_eval.sh --only-argus
-  # Full stratified B0..B3 + Argus-SQL evaluation (reuses cached B0..B3 checkpoints):
+  # Full stratified B0..B4 + Argus-SQL evaluation (reuses cached B0+/B1/B2 checkpoints):
   ./scripts/run_personal_eval.sh --recompute-argus
   ```
 

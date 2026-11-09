@@ -29,8 +29,10 @@ from argus_sql.evaluation.mini_bird_suite import run_benchmark_suite
 from argus_sql.evaluation.types import BenchmarkSuiteReport
 from argus_sql.evaluation.types import TaskEvalRecord
 from argus_sql.pipelines.argus_pipeline import ArgusSQLPipeline
-from argus_sql.pipelines.baseline_pipelines import CHESSValueConsistencyPipeline
-from argus_sql.pipelines.baseline_pipelines import ZeroShotDDLPipeline
+from argus_sql.pipelines.baseline_pipelines import EnrichedMDDLPipeline
+from argus_sql.pipelines.baseline_pipelines import LLMJudgePipeline
+from argus_sql.pipelines.baseline_pipelines import RawDDLPipeline
+from argus_sql.pipelines.baseline_pipelines import ValueMajorityVotePipeline
 from argus_sql.sandbox.sqlite_sandbox import SQLiteReadOnlySandbox
 from argus_sql.sandbox.types import SandboxPolicy
 
@@ -49,7 +51,7 @@ class EvaluationModuleTest(unittest.TestCase):
   def test_mini_bird_gold_sql_validity_and_argus_statistical_significance(
       self,
   ) -> None:
-    """All 24 gold queries execute non-emptily and Argus beats B3 (p < 0.01)."""
+    """All 24 gold queries execute non-emptily; Argus beats B3 & B4 on Voice."""
     with tempfile.TemporaryDirectory() as tmp:
       root = pathlib.Path(tmp)
       schemas, paths = materialize_mini_bird_databases(root)
@@ -63,11 +65,13 @@ class EvaluationModuleTest(unittest.TestCase):
         self.assertTrue(gold_out.succeeded, msg=f"Broken gold: {task.question_id}")
         self.assertGreater(gold_out.row_count, 0, msg=f"Empty: {task.question_id}")
 
-      # Evaluate B0, B3, and Argus-SQL over identical schemas and synthesizer.
+      # Evaluate B0, B0+, B3, B4, and Argus-SQL over identical schemas & synth.
       synth = SchemaGuidedDiagnosticSynthesizer()
       pipes = (
-          ZeroShotDDLPipeline(synth, sandbox),
-          CHESSValueConsistencyPipeline(synth, sandbox),
+          RawDDLPipeline(synth, sandbox),
+          EnrichedMDDLPipeline(synth, sandbox),
+          ValueMajorityVotePipeline(synth, sandbox),
+          LLMJudgePipeline(synth, sandbox),
           ArgusSQLPipeline(synth, sandbox),
       )
       # Run both Clean and spoken Voice-BIRD suites to verify robustness gains.
@@ -79,18 +83,27 @@ class EvaluationModuleTest(unittest.TestCase):
       )
       ex_clean = {s.system_name: s.ex_overall for s in clean_rep.summaries}
       ex_voice = {s.system_name: s.ex_overall for s in voice_rep.summaries}
+      tok_clean = {s.system_name: s.mean_tokens for s in clean_rep.summaries}
 
-      # Argus-SQL must strictly outperform B0 and B3 on both Clean and Voice!
-      self.assertGreater(ex_clean["Argus-SQL"], ex_clean["B0_ZeroShotDDL"])
-      self.assertGreater(ex_clean["Argus-SQL"], ex_clean["B3_CHESSValueConsistency"])
-      self.assertGreater(ex_voice["Argus-SQL"], ex_voice["B3_CHESSValueConsistency"])
+      # Argus-SQL must outperform B0/B0+/B3 on Clean, beat B4 on Voice & tokens!
+      self.assertGreater(ex_clean["Argus-SQL"], ex_clean["B0_RawDDL"])
+      self.assertGreater(ex_clean["Argus-SQL"], ex_clean["B0+_EnrichedMDDL"])
+      self.assertGreater(ex_clean["Argus-SQL"], ex_clean["B3_ValueMajorityVote"])
+      self.assertGreater(ex_voice["B4_LLMJudge"], ex_voice["B3_ValueMajorityVote"])
+      self.assertGreater(ex_voice["Argus-SQL"], ex_voice["B4_LLMJudge"])
+      self.assertLess(tok_clean["Argus-SQL"], tok_clean["B4_LLMJudge"])
 
-      # Paired McNemar test between B3 and Argus-SQL must confirm p < 0.005!
+      # Paired McNemar tests confirm statistical significance vs B3 and B4!
       rec_map = dict(clean_rep.records_by_system)
+      voice_map = dict(voice_rep.records_by_system)
       p_val = compute_mcnemar_p_value(
-          rec_map["B3_CHESSValueConsistency"], rec_map["Argus-SQL"]
+          rec_map["B3_ValueMajorityVote"], rec_map["Argus-SQL"]
       )
       self.assertLess(p_val, 0.005)
+      p_val_b4_voice = compute_mcnemar_p_value(
+          voice_map["B4_LLMJudge"], voice_map["Argus-SQL"]
+      )
+      self.assertLess(p_val_b4_voice, 0.02)
       # Identical record comparisons must yield p = 1.0, and mismatches raise.
       self.assertEqual(
           compute_mcnemar_p_value(rec_map["Argus-SQL"], rec_map["Argus-SQL"]),
@@ -99,10 +112,11 @@ class EvaluationModuleTest(unittest.TestCase):
       with self.assertRaises(EvaluationError):
         compute_mcnemar_p_value(rec_map["Argus-SQL"][:1], rec_map["Argus-SQL"])
 
-      # Export LaTeX table and confirm Argus-SQL row is bolded for publication.
+      # Export LaTeX table and confirm B0+ and Argus-SQL rows render cleanly.
       tex = render_comparative_latex_table(
           clean_rep, voice_rep, "Caption", "tab:test"
       )
+      self.assertIn(r"B0+\_EnrichedMDDL", tex)
       self.assertIn(r"\textbf{Argus-SQL}", tex)
 
   def test_bird_loader_parses_official_json_schema_structure(self) -> None:
@@ -640,7 +654,24 @@ class EvaluationModuleTest(unittest.TestCase):
       self.assertIsNone(
           reloaded_ckpt.get("Clean", "Argus-SQL", strat_slice[0].question_id)
       )
-      reloaded_ckpt.clear_all()
+
+      # Legacy `B0_ZeroShotDDL` records migrate transparently to `B0+_EnrichedMDDL`
+      # on reload, whereas `B3_CHESSValueConsistency` does NOT alias onto
+      # steelmanned `B3_ValueMajorityVote` so B3 re-evaluates with raw entities.
+      sample_rec = rep1.records_by_system[0][1][0]
+      reloaded_ckpt.record("Clean", "B0_ZeroShotDDL", sample_rec)
+      reloaded_ckpt.record("Clean", "B3_CHESSValueConsistency", sample_rec)
+      migrated_ckpt = LiveRunCheckpointer(ckpt_file)
+      self.assertIsNotNone(
+          migrated_ckpt.get("Clean", "B0+_EnrichedMDDL", sample_rec.question_id)
+      )
+      self.assertIsNone(
+          migrated_ckpt.get(
+              "Clean", "B3_ValueMajorityVote", sample_rec.question_id
+          )
+      )
+      self.assertEqual(migrated_ckpt.invalidate_system("B0+_EnrichedMDDL"), 1)
+      migrated_ckpt.clear_all()
       self.assertFalse(ckpt_file.exists())
 
 

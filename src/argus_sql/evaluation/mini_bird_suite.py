@@ -24,10 +24,12 @@ from argus_sql.evaluation.types import SystemEvalSummary
 from argus_sql.evaluation.types import TaskEvalRecord
 from argus_sql.linking.value_retriever import CellValueRetriever
 from argus_sql.pipelines.argus_pipeline import ArgusSQLPipeline
-from argus_sql.pipelines.baseline_pipelines import CHESSValueConsistencyPipeline
-from argus_sql.pipelines.baseline_pipelines import DINDecomposedPipeline
-from argus_sql.pipelines.baseline_pipelines import MACRefinerPipeline
-from argus_sql.pipelines.baseline_pipelines import ZeroShotDDLPipeline
+from argus_sql.pipelines.baseline_pipelines import EnrichedMDDLPipeline
+from argus_sql.pipelines.baseline_pipelines import ExecRefinerPipeline
+from argus_sql.pipelines.baseline_pipelines import LLMJudgePipeline
+from argus_sql.pipelines.baseline_pipelines import LexicalCoTPipeline
+from argus_sql.pipelines.baseline_pipelines import RawDDLPipeline
+from argus_sql.pipelines.baseline_pipelines import ValueMajorityVotePipeline
 from argus_sql.pipelines.types import ArgusAblationConfig
 from argus_sql.pipelines.types import NL2SQLPipeline
 from argus_sql.sandbox.sqlite_sandbox import SQLiteReadOnlySandbox
@@ -36,21 +38,23 @@ from argus_sql.sandbox.sqlite_sandbox import SQLiteReadOnlySandbox
 def build_main_systems(
     llm: BatchLLMPort, sandbox: SQLiteReadOnlySandbox
 ) -> tuple[NL2SQLPipeline, ...]:
-  """Constructs B0, B1, B2, B3, and full Argus-SQL comparative systems.
+  """Constructs B0, B0+, B1, B2, B3, B4, and full Argus-SQL operator pipelines.
 
   Args:
     llm: BatchLLMPort completion adapter shared across all systems.
     sandbox: Read-only SQLite execution sandbox.
 
   Returns:
-    Five-element tuple of progressive comparative NL2SQL pipelines.
+    Seven-element tuple of progressive controlled operator NL2SQL pipelines.
   """
-  # Instantiate all five progressive architectures over identical ports.
+  # Order B4 immediately after B3 so B4 reuses B3's SHA-256 cached K=3 prompts.
   return (
-      ZeroShotDDLPipeline(llm, sandbox),
-      DINDecomposedPipeline(llm, sandbox),
-      MACRefinerPipeline(llm, sandbox),
-      CHESSValueConsistencyPipeline(llm, sandbox),
+      RawDDLPipeline(llm, sandbox),
+      EnrichedMDDLPipeline(llm, sandbox),
+      LexicalCoTPipeline(llm, sandbox),
+      ExecRefinerPipeline(llm, sandbox),
+      ValueMajorityVotePipeline(llm, sandbox),
+      LLMJudgePipeline(llm, sandbox),
       ArgusSQLPipeline(llm, sandbox, ArgusAblationConfig(system_name="Argus-SQL")),
   )
 
@@ -169,7 +173,7 @@ def run_benchmark_suite(
       for db_id in active_db_ids
   }
   # Batch-execute reference `gold_sql` queries once per database via `execute_batch`
-  # so evaluating 5-6 comparative/ablation pipelines never repeats identical scans.
+  # so evaluating 6-7 comparative/ablation pipelines never repeats identical scans.
   gold_by_qid: dict[str, ExecutionOutcome] = {}
   for db_id in active_db_ids:
     db_tasks = [t for t in active_tasks if t.db_id == db_id]

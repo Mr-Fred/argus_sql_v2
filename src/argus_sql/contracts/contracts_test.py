@@ -177,6 +177,34 @@ class ContractsAndDDLTest(unittest.TestCase):
     self.assertIn("matched_values: ['Fresno']", ddl)
     self.assertIn("examples: ['Hayward', 'Newark']", ddl)
 
+  def test_raw_ddl_mode_omits_profiler_comments_while_keeping_constraints(
+      self,
+  ) -> None:
+    """`include_metadata_comments=False` emits pure DDL for `B0_RawDDL`."""
+    import sqlite3
+
+    schema = self._sample_schema()
+    vm = ValueMatch("schools", "county", "Alameda", "Alameda", 1.0)
+    raw_ddl = render_schema_ddl(
+        schema, value_matches=(vm,), include_metadata_comments=False
+    )
+    enriched_ddl = render_schema_ddl(
+        schema, value_matches=(vm,), include_metadata_comments=True
+    )
+    # Raw DDL retains PK/FK constraints and quoting, with zero `--` annotations.
+    self.assertNotIn("--", raw_ddl)
+    self.assertNotIn("County name", raw_ddl)
+    self.assertNotIn("Oakland USD", raw_ddl)
+    self.assertNotIn("matched_values", raw_ddl)
+    self.assertIn("PRIMARY KEY", raw_ddl)
+    self.assertIn("FOREIGN KEY (cds_code) REFERENCES schools(cds_code)", raw_ddl)
+    self.assertIn("County name", enriched_ddl)
+    conn = sqlite3.connect(":memory:")
+    try:
+      conn.executescript(raw_ddl)
+    finally:
+      conn.close()
+
 
 if __name__ == "__main__":
   unittest.main()

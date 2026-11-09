@@ -37,6 +37,7 @@ LIMIT="${ARGUS_LIMIT:-22}"
 CONCURRENCY="${ARGUS_CONCURRENCY:-16}"
 STRATIFIED="${ARGUS_STRATIFIED:-1}"
 RECOMPUTE_ARGUS="${ARGUS_RECOMPUTE_ARGUS:-0}"
+RECOMPUTE_SYSTEMS="${ARGUS_RECOMPUTE_SYSTEMS:-}"
 FRESH_CHECKPOINT="${ARGUS_FRESH_CHECKPOINT:-0}"
 
 CLI_FLAGS=()
@@ -45,6 +46,9 @@ if [ "${STRATIFIED}" = "1" ] || [ "${STRATIFIED}" = "true" ]; then
 fi
 if [ "${RECOMPUTE_ARGUS}" = "1" ] || [ "${RECOMPUTE_ARGUS}" = "true" ]; then
   CLI_FLAGS+=(--recompute-argus)
+fi
+if [ -n "${RECOMPUTE_SYSTEMS}" ]; then
+  CLI_FLAGS+=(--recompute-systems "${RECOMPUTE_SYSTEMS}")
 fi
 if [ "${FRESH_CHECKPOINT}" = "1" ] || [ "${FRESH_CHECKPOINT}" = "true" ]; then
   CLI_FLAGS+=(--fresh-checkpoint)

@@ -64,10 +64,14 @@ def _format_column_entry(
     col: ColumnSchema,
     grounded_literals: Sequence[str],
     inline_pk: bool = True,
+    include_metadata_comments: bool = True,
 ) -> tuple[str, str]:
   """Builds `(column_decl, inline_comment)` for a single DDL column line."""
   pk_suffix = " PRIMARY KEY" if (col.is_primary_key and inline_pk) else ""
   col_decl = f"  {_quote_sql_identifier(col.name)} {col.data_type}{pk_suffix}"
+  # Pure raw-DDL baselines (`B0_RawDDL`) omit all inline metadata annotations.
+  if not include_metadata_comments:
+    return (col_decl, "")
 
   # Combine description, grounded matches, domain range, or fallback examples.
   notes: list[str] = []
@@ -96,6 +100,7 @@ def render_schema_ddl(
     selected_columns: Mapping[str, Sequence[str]] | None = None,
     fk_edges: Sequence[ForeignKeyEdge] | None = None,
     value_matches: Sequence[ValueMatch] = (),
+    include_metadata_comments: bool = True,
 ) -> str:
   """Serializes a full or pruned DatabaseSchema into compact SQLite DDL text.
 
@@ -106,6 +111,9 @@ def render_schema_ddl(
     fk_edges: Optional subset of ForeignKeyEdge items to render; defaults to
       all edges whose endpoints belong to rendered tables.
     value_matches: Grounded cell literals attached to matching column comments.
+    include_metadata_comments: When True, attaches `-- description | range |
+      examples | matched_values` comments; when False, emits pure `CREATE TABLE`
+      column types and PK/FK constraints only (`B0_RawDDL`).
 
   Returns:
     Deterministic multi-table `CREATE TABLE` DDL string for prompt injection.
@@ -159,7 +167,12 @@ def render_schema_ddl(
         continue
       hits = grounded_index.get((tbl_lower, col.name.lower()), ())
       table_entries.append(
-          _format_column_entry(col, hits, inline_pk=not is_composite_pk)
+          _format_column_entry(
+              col,
+              hits,
+              inline_pk=not is_composite_pk,
+              include_metadata_comments=include_metadata_comments,
+          )
       )
 
     # Append composite PRIMARY KEY (...) and explicit FOREIGN KEY clauses.
