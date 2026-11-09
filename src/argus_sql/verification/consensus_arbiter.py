@@ -134,10 +134,12 @@ def verify_and_rank_candidates(
     strategies = tuple(
         sorted({verified_list[i].candidate.strategy for i in indices})
     )
+    # Award diversity credit strictly to completely invariant-clean candidates
+    # so 2 WARNING-flagged or empty-set candidates cannot outvote 1 clean SQL.
     clean_strategies = {
         verified_list[i].candidate.strategy
         for i in indices
-        if not any(iss.severity == "ERROR" for iss in verified_list[i].issues)
+        if not verified_list[i].issues
     }
     diversity = cfg.strategy_diversity_bonus * max(0, len(clean_strategies) - 1)
     clusters.append(
@@ -149,11 +151,16 @@ def verify_and_rank_candidates(
         )
     )
 
-  # Rank clusters by total consensus score, breaking ties by fastest execution.
+  # Rank error-free clusters ahead of ERROR-only clusters regardless of K, then
+  # by total consensus score, breaking ties by fastest sandbox execution time.
   ranked_clusters = tuple(
       sorted(
           clusters,
           key=lambda c: (
+              any(
+                  not any(iss.severity == "ERROR" for iss in verified_list[i].issues)
+                  for i in c.member_indices
+              ),
               c.total_score,
               -min(verified_list[i].outcome.execution_time_ms for i in c.member_indices),
           ),

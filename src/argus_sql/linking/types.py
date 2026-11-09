@@ -68,10 +68,10 @@ class SchemaLinkerConfig:
     top_k_values: Maximum grounded `ValueMatch` items retained per query.
   """
 
-  # Prune ultra-wide tables (>32 cols, e.g., 115-col sports/card tables) cleanly.
-  max_columns_per_table: int = 32
-  # Narrow and medium tables keep 100% of columns once the table is selected.
-  full_table_column_ceiling: int = 32
+  # Prune ultra-wide tables (>50 cols, e.g., 115-col sports/card tables) cleanly.
+  max_columns_per_table: int = 36
+  # Narrow and medium tables (<=50 cols) keep 100% of columns once selected.
+  full_table_column_ceiling: int = 50
   # Threshold suppresses random 1-character substring collisions during seeding.
   min_column_score: float = 0.18
   enable_fk_closure: bool = True

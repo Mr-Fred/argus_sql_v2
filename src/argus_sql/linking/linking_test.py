@@ -187,6 +187,55 @@ class LinkingModuleTest(unittest.TestCase):
     )
     self.assertEqual(narrative.expected_projection_arity, 0)
 
+  def test_iteration3_localization_stems_and_medium_table_column_retention(
+      self,
+  ) -> None:
+    """Translation phrasing seeds foreign_data and <=50-col tables keep 100% cols."""
+    # 1. `translation` stems to `foreign` + `language`, seeding `foreign_data`.
+    cards = TableSchema(
+        "cards",
+        (
+            ColumnSchema("id", "INTEGER", is_primary_key=True),
+            ColumnSchema("uuid", "TEXT"),
+            ColumnSchema("isStorySpotlight", "INTEGER"),
+        ),
+    )
+    foreign_data = TableSchema(
+        "foreign_data",
+        (
+            ColumnSchema("id", "INTEGER", is_primary_key=True),
+            ColumnSchema("language", "TEXT"),
+            ColumnSchema("uuid", "TEXT"),
+        ),
+    )
+    sets = TableSchema(
+        "sets",
+        tuple(
+            [ColumnSchema("id", "INTEGER", is_primary_key=True), ColumnSchema("code", "TEXT")]
+            + [ColumnSchema(f"attr_{i}", "TEXT") for i in range(18)]
+        ),
+    )
+    cg_schema = DatabaseSchema(
+        "card_games",
+        (cards, foreign_data, sets),
+        (ForeignKeyEdge("foreign_data", "uuid", "cards", "uuid"),),
+    )
+    tr_intent = canonicalize_intent(
+        "Among Story Spotlight card printings, what percentage have a French translation?"
+    )
+    linked_cg = link_schema_with_fk_closure(cg_schema, tr_intent)
+    self.assertIn("foreign_data", linked_cg.selected_tables)
+
+    # 2. 44-column clinical laboratory table retains 100% of columns (`<= 50`).
+    lab_cols = (ColumnSchema("ID", "INTEGER", is_primary_key=True),) + tuple(
+        ColumnSchema(f"LAB_{idx}", "REAL") for idx in range(43)
+    )
+    lab_schema = DatabaseSchema("clinical_wide", (TableSchema("Laboratory", lab_cols),))
+    lab_intent = canonicalize_intent("How many abnormal lab readings occurred?")
+    linked_lab = link_schema_with_fk_closure(lab_schema, lab_intent)
+    kept_cols = dict(linked_lab.selected_columns)["Laboratory"]
+    self.assertEqual(len(kept_cols), 44)
+
 
 if __name__ == "__main__":
   unittest.main()

@@ -38,6 +38,7 @@ def _wide_table_column_priority(col_name: str, data_type: str) -> float:
   priority_keywords = (
       "type", "status", "name", "city", "county", "state", "country", "date",
       "year", "grade", "score", "rate", "charter", "email", "phone", "street",
+      "goal", "win", "points", "rank", "position",
   )
   if any(kw in low for kw in priority_keywords):
     return 0.02

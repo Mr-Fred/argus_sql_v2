@@ -295,3 +295,53 @@ class LiveRunCheckpointer:
         handle.write(line)
         handle.flush()
         os.fsync(handle.fileno())
+
+  def invalidate_system(self, system_name: str) -> int:
+    """Evicts cached evaluations for `system_name` and compacts disk JSONL.
+
+    Enables rapid iterative re-evaluation of `Argus-SQL` (`--recompute-argus`)
+    against frozen `B0..B3` baseline checkpoints without repeating baseline
+    LLM calls or reading stale `Argus-SQL` predictions.
+
+    Args:
+      system_name: Pipeline identifier to evict (e.g., `'Argus-SQL'`).
+
+    Returns:
+      Number of evicted `(suite_name, system_name, question_id)` records.
+    """
+    # Hold lock across cache eviction and atomic temp-file compaction.
+    with self._lock:
+      drop_keys = [k for k in self._cache if k[1] == system_name]
+      if not drop_keys:
+        return 0
+      for key in drop_keys:
+        del self._cache[key]
+      # Rewrite JSONL via `.jsonl.tmp` + `fsync` + `replace` for crash safety.
+      if self.checkpoint_path.is_file() and not self.checkpoint_path.is_symlink():
+        kept_lines: list[str] = []
+        for raw_ln in self.checkpoint_path.read_text(encoding="utf-8").splitlines():
+          if not raw_ln.strip():
+            continue
+          try:
+            parsed = json.loads(raw_ln)
+            if isinstance(parsed, dict) and parsed.get("system_name") == system_name:
+              continue
+          except json.JSONDecodeError:
+            continue
+          kept_lines.append(raw_ln + "\n")
+        # Atomic POSIX/NTFS rename prevents partial truncation on power loss.
+        tmp_path = self.checkpoint_path.with_suffix(".jsonl.tmp")
+        with tmp_path.open("w", encoding="utf-8") as handle:
+          handle.writelines(kept_lines)
+          handle.flush()
+          os.fsync(handle.fileno())
+        tmp_path.replace(self.checkpoint_path)
+      return len(drop_keys)
+
+  def clear_all(self) -> None:
+    """Clears all in-memory and on-disk records for a completely fresh run."""
+    # Never unlink symlinks; remove only regular confined checkpoint files.
+    with self._lock:
+      self._cache.clear()
+      if self.checkpoint_path.is_file() and not self.checkpoint_path.is_symlink():
+        self.checkpoint_path.unlink()

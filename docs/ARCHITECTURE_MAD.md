@@ -63,7 +63,7 @@ argus_sql/
     ├── contracts/                    # Pure domain dataclasses & range/composite-PK DDL
     ├── linking/                      # Voice canon., 3-gram/code index & FK/junction graph
     ├── sandbox/                      # Read-only authorizer-locked SQLite sandbox
-    ├── verification/                 # 7 SQLite invariants, range/alg. repair & vote
+    ├── verification/                 # 10 dialect/relational invariants, repair & vote
     ├── adapters/                     # Vertex/OpenAI batch HTTPS & DDL synthesizer
     ├── pipelines/                    # B0, B1, B2, B3 baselines & Argus-SQL hybrid
     └── evaluation/                   # BIRD EX/R-VES, MIN..MAX/CSV hydration & triage

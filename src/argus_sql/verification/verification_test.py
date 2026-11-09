@@ -364,6 +364,120 @@ class VerificationAndArbiterTest(unittest.TestCase):
     # Exact `'Alameda'` and multi-word `'It''s alameda'` both remain untouched!
     self.assertIsNone(apply_algebraic_sql_repairs(exact_cand, p_issues, prefix_linked))
 
+  def test_iteration3_relational_join_ratio_entity_key_and_boolean_avg(
+      self,
+  ) -> None:
+    """1:N LEFT JOIN ratios, display-name GROUP BY, and boolean AVG are caught."""
+    # 1. 1:N child `LEFT JOIN ... ON ... AND ...` ratio triggers ERROR, whereas
+    #    1:0..1 PK-joined extension `LEFT JOIN` triggers zero false positives.
+    card_ddl = (
+        "CREATE TABLE cards (\n  id INTEGER PRIMARY KEY,\n  uuid TEXT,\n"
+        "  isStorySpotlight INTEGER\n);\n\n"
+        "CREATE TABLE foreign_data (\n  id INTEGER PRIMARY KEY,\n"
+        "  language TEXT,\n  uuid TEXT\n);\n\n"
+        "CREATE TABLE satscores (\n  cds TEXT PRIMARY KEY,\n  AvgScrMath INTEGER\n);"
+    )
+    linked_cards = LinkedSchemaContext(
+        "card_games", ("cards", "foreign_data"), (), (), (), (), card_ddl
+    )
+    pct_intent = canonicalize_intent(
+        "What is the percentage of French cards among Story Spotlight cards?"
+    )
+    bad_lj = SQLCandidate(
+        "SELECT CAST(COUNT(T2.id) AS REAL) * 100.0 / NULLIF(COUNT(T1.id), 0) "
+        "FROM cards AS T1 LEFT JOIN foreign_data AS T2 "
+        "ON T1.uuid = T2.uuid AND T2.language = 'French' "
+        "WHERE T1.isStorySpotlight = 1",
+        "formula_defensive",
+    )
+    clean_ij = SQLCandidate(
+        "SELECT 100.0 * COUNT(CASE WHEN T2.language = 'French' THEN 1 END) / COUNT(*) "
+        "FROM cards AS T1 INNER JOIN foreign_data AS T2 ON T1.uuid = T2.uuid "
+        "WHERE T1.isStorySpotlight = 1",
+        "skeleton_minimal",
+    )
+    bad_sig = compute_result_signature(((66.7,),))
+    good_sig = compute_result_signature(((12.5,),))
+    bad_out = ExecutionOutcome(True, ((66.7,),), ("p",), 1, 1.0, "", bad_sig)
+    good_out = ExecutionOutcome(True, ((12.5,),), ("p",), 1, 1.0, "", good_sig)
+    lj_issues = audit_candidate_invariants(bad_lj, bad_out, pct_intent, linked_cards)
+    self.assertEqual(lj_issues[0].code, "LEFT_JOIN_FILTERED_RATIO")
+    self.assertEqual(lj_issues[0].severity, "ERROR")
+    # 1 clean INNER JOIN candidate beats even 2 distorted LEFT JOIN candidates!
+    lj_win, _, _ = verify_and_rank_candidates(
+        (bad_lj, bad_lj, clean_ij),
+        (bad_out, bad_out, good_out),
+        pct_intent,
+        linked_cards,
+    )
+    self.assertEqual(lj_win.candidate.sql, clean_ij.sql)
+
+    # 1:0..1 PK-joined `satscores (cds PRIMARY KEY)` must NOT false-alarm!
+    pk_lj = SQLCandidate(
+        "SELECT CAST(COUNT(T2.cds) AS REAL) / COUNT(T1.id) FROM cards T1 "
+        "LEFT JOIN satscores T2 ON T1.uuid = T2.cds AND T2.AvgScrMath > 500",
+        "cot",
+    )
+    self.assertEqual(
+        audit_candidate_invariants(pk_lj, good_out, pct_intent, linked_cards), ()
+    )
+
+    # 2. `GROUP BY T.team_long_name` (and `GROUP BY T.team_api_id, T.team_long_name`)
+    #    rewrites algebraically to `GROUP BY M.away_team_api_id` at 0 token cost,
+    #    and 1 clean entity-key candidate (1.00) beats 2 name-grouped ones (0.96).
+    win_intent = canonicalize_intent(
+        "Which away team won the most during the 2010 season?"
+    )
+    name_gb = SQLCandidate(
+        "SELECT T.team_long_name FROM Match AS M\n"
+        "INNER JOIN League AS L ON M.league_id = L.id\n"
+        "INNER JOIN Team AS T\n  ON M.away_team_api_id = T.team_api_id\n"
+        "WHERE M.away_team_goal > M.home_team_goal\n"
+        "GROUP BY\n  T.team_long_name\nORDER BY COUNT(*) DESC LIMIT 1",
+        "formula_defensive",
+    )
+    pair_gb = SQLCandidate(
+        "SELECT T.team_long_name FROM Match AS M "
+        "INNER JOIN Team AS T ON M.away_team_api_id = T.team_api_id "
+        "GROUP BY T.team_api_id, T.team_long_name ORDER BY COUNT(*) DESC LIMIT 1",
+        "decomposed_cot",
+    )
+    t_sig_a = compute_result_signature((("Celtic",),))
+    t_sig_b = compute_result_signature((("Rangers",),))
+    out_a = ExecutionOutcome(True, (("Celtic",),), ("n",), 1, 1.0, "", t_sig_a)
+    out_b = ExecutionOutcome(True, (("Rangers",),), ("n",), 1, 1.0, "", t_sig_b)
+    gb_issues = audit_candidate_invariants(name_gb, out_a, win_intent)
+    self.assertIn("NON_KEY_ENTITY_GROUPING", {i.code for i in gb_issues})
+    gb_rep = apply_algebraic_sql_repairs(name_gb, gb_issues)
+    self.assertIsNotNone(gb_rep)
+    assert gb_rep is not None
+    self.assertIn("GROUP BY\n  M.away_team_api_id", gb_rep.sql)
+    pair_issues = audit_candidate_invariants(pair_gb, out_a, win_intent)
+    pair_rep = apply_algebraic_sql_repairs(pair_gb, pair_issues)
+    self.assertIsNotNone(pair_rep)
+    assert pair_rep is not None
+    self.assertIn("GROUP BY M.away_team_api_id ORDER BY", pair_rep.sql)
+
+    # Verify 1 clean entity-key candidate (1.00) outvotes 2 WARNING ones (0.96).
+    gb_win, _, _ = verify_and_rank_candidates(
+        (name_gb, pair_gb, gb_rep), (out_a, out_a, out_b), win_intent
+    )
+    self.assertEqual(gb_win.outcome.result_signature, t_sig_b)
+
+    # 3. `AVG(T1.element = 'o')` on average-count-per-entity question flags ERROR.
+    cnt_avg_intent = canonicalize_intent(
+        "Calculate the average number of oxygen atoms in single-bonded molecules.",
+        evidence="single-bonded refers to bond_type = '-'; AVG(element = 'o')",
+    )
+    bool_avg_cand = SQLCandidate(
+        "SELECT AVG(T1.element = 'o') FROM atom T1 JOIN bond T2 "
+        "ON T1.molecule_id = T2.molecule_id WHERE T2.bond_type = '-'",
+        "formula_defensive",
+    )
+    b_issues = audit_candidate_invariants(bool_avg_cand, good_out, cnt_avg_intent)
+    self.assertEqual(b_issues[0].code, "BOOLEAN_AVG_FOR_COUNT")
+    self.assertEqual(b_issues[0].severity, "ERROR")
+
 
 if __name__ == "__main__":
   unittest.main()

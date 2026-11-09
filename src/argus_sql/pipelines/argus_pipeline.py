@@ -132,7 +132,7 @@ class ArgusSQLPipeline:
       strategies = (
           ("decomposed_cot", 0.0),
           ("formula_defensive", 0.0),
-          ("skeleton_minimal", 0.2),
+          ("skeleton_minimal", 0.1),
       )
 
     batch_reqs = tuple(

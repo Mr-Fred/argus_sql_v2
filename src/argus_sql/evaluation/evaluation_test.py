@@ -635,6 +635,13 @@ class EvaluationModuleTest(unittest.TestCase):
           checkpointer=reloaded_ckpt,
       )
       self.assertEqual(rep1.summaries[0].ex_overall, rep2.summaries[0].ex_overall)
+      # Evicting `Argus-SQL` clears its 3 cached entries and compacts JSONL.
+      self.assertEqual(reloaded_ckpt.invalidate_system("Argus-SQL"), 3)
+      self.assertIsNone(
+          reloaded_ckpt.get("Clean", "Argus-SQL", strat_slice[0].question_id)
+      )
+      reloaded_ckpt.clear_all()
+      self.assertFalse(ckpt_file.exists())
 
 
 if __name__ == "__main__":

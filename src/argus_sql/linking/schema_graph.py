@@ -88,6 +88,9 @@ def _stem_word(tok: str) -> set[str]:
   for prefix, root in _DERIVATIONAL_PREFIXES:
     if tok.startswith(prefix):
       forms.add(root)
+  # Bridge localization phrasing ('translation') to `foreign` / `language` cols.
+  if tok.startswith("translat"):
+    forms.update({"foreign", "language"})
   return forms
 
 
@@ -302,7 +305,7 @@ def expand_fk_subgraph(
           parent_obj is not None
           and parent_low not in selected_set
           and len(outgoing_by_src.get(parent_low, ())) <= max_parent_out
-          and len(parent_obj.columns) <= 12
+          and len(parent_obj.columns) <= 16
           and len(selected_set) < 12
       ):
         selected_set.add(parent_low)

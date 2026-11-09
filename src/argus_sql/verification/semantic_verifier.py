@@ -12,6 +12,9 @@ from argus_sql.contracts.types import IntentFrame
 from argus_sql.contracts.types import InvariantIssue
 from argus_sql.contracts.types import LinkedSchemaContext
 from argus_sql.contracts.types import SQLCandidate
+from argus_sql.verification.relational_invariants import check_boolean_avg_for_count
+from argus_sql.verification.relational_invariants import check_left_join_filtered_ratio
+from argus_sql.verification.relational_invariants import check_non_key_entity_grouping
 
 # Matches floating-point cast, AVG/TOTAL real aggregates, or float-literal
 # promotion idioms (`* 100.0`, `100.0 *`, `/ 12.0`) in SQLite divisions.
@@ -311,5 +314,15 @@ def audit_candidate_invariants(
               repair_hint="Use `SELECT DISTINCT` to deduplicate 1-to-many joins.",
           )
       )
+
+  # 8-10. Audit multi-table relational join ratios, boolean AVG, and entity keys.
+  ddl_text = linked_schema.ddl_prompt if linked_schema is not None else ""
+  for rel_issue in (
+      check_left_join_filtered_ratio(sql_text, no_strings_sql, no_quotes_sql, ddl_text),
+      check_boolean_avg_for_count(no_quotes_sql, intent),
+      check_non_key_entity_grouping(sql_text),
+  ):
+    if rel_issue is not None:
+      issues.append(rel_issue)
 
   return tuple(issues)

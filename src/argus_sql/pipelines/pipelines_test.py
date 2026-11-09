@@ -309,6 +309,185 @@ class ComparativePipelinesTest(unittest.TestCase):
       win_out = sandbox.execute(db_file, pred.final_sql)
       self.assertEqual(set(win_out.rows), {("Diesel",), ("Natural 95",)})
 
+  def test_argus_repairs_entity_name_grouping_and_1_to_many_left_join_ratio(
+      self,
+  ) -> None:
+    """Pipeline repairs `GROUP BY T.team_long_name` (0 tok) & 1:N LEFT JOIN %."""
+    from collections.abc import Sequence
+    from argus_sql.adapters.types import LLMCompletionRequest
+    from argus_sql.adapters.types import LLMCompletionResponse
+
+    class _RelationalTrapMockLLM:
+      """Emits entity-name GROUP BY and 1:N LEFT JOIN traps to test Stage 4."""
+
+      def batch_complete(
+          self, requests: Sequence[LLMCompletionRequest]
+      ) -> tuple[LLMCompletionResponse, ...]:
+        """Returns trap SQL on initial K=3 passes and clean SQL on Stage 4b.
+
+        Args:
+          requests: Batch of synthesis or Stage 4b repair requests.
+
+        Returns:
+          Tuple of mock SQL completion responses aligned 1-to-1 with requests.
+        """
+        outs: list[LLMCompletionResponse] = []
+        for req in requests:
+          if "away team" in req.user_prompt.lower():
+            # All 3 strategies group by `T.team_long_name` (conflating two
+            # distinct clubs named 'United FC' into 2 wins > 'Rangers' 1 win!).
+            sql = (
+                "SELECT T.team_long_name FROM Match AS M "
+                "INNER JOIN Team AS T ON M.away_team_api_id = T.team_api_id "
+                "WHERE M.away_team_goal > M.home_team_goal "
+                "GROUP BY T.team_long_name ORDER BY COUNT(*) DESC LIMIT 1"
+            )
+          elif req.strategy_tag == "repair":
+            # Stage 4b repair triggered by ERROR `LEFT_JOIN_FILTERED_RATIO`.
+            assert "LEFT_JOIN_FILTERED_RATIO" in req.user_prompt
+            sql = (
+                "SELECT CAST(SUM(CASE WHEN T2.language = 'French' THEN 1 "
+                "ELSE 0 END) AS REAL) * 100 / COUNT(T1.id) "
+                "FROM cards AS T1 INNER JOIN foreign_data AS T2 "
+                "ON T1.uuid = T2.uuid WHERE T1.isStorySpotlight = 1"
+            )
+          else:
+            # All 3 initial strategies emit distorted 1:N `LEFT JOIN ... AND`.
+            sql = (
+                "SELECT CAST(COUNT(T2.id) AS REAL) * 100.0 / NULLIF(COUNT(T1.id), 0) "
+                "FROM cards AS T1 LEFT JOIN foreign_data AS T2 "
+                "ON T1.uuid = T2.uuid AND T2.language = 'French' "
+                "WHERE T1.isStorySpotlight = 1"
+            )
+          outs.append(LLMCompletionResponse(req.request_id, sql, sql, 80, 25))
+        return tuple(outs)
+
+    with tempfile.TemporaryDirectory() as tmp:
+      root = pathlib.Path(tmp)
+      db_file = root / "rel_traps.sqlite"
+      conn = sqlite3.connect(db_file)
+      try:
+        conn.executescript("""
+          CREATE TABLE Team (
+            id INTEGER PRIMARY KEY, team_api_id INTEGER, team_long_name TEXT
+          );
+          CREATE TABLE Match (
+            id INTEGER PRIMARY KEY, away_team_api_id INTEGER,
+            home_team_goal INTEGER, away_team_goal INTEGER
+          );
+          CREATE TABLE cards (
+            id INTEGER PRIMARY KEY, uuid TEXT, isStorySpotlight INTEGER
+          );
+          CREATE TABLE foreign_data (
+            id INTEGER PRIMARY KEY, uuid TEXT, language TEXT
+          );
+        """)
+        # Two distinct clubs named `'United FC'` have 2 wins each (4 if wrongly
+        # merged by name!), whereas `'Rangers'` (`team_api_id=10`) has 3 wins!
+        conn.executemany(
+            "INSERT INTO Team VALUES (?, ?, ?)",
+            [(1, 10, "Rangers"), (2, 20, "United FC"), (3, 30, "United FC")],
+        )
+        conn.executemany(
+            "INSERT INTO Match VALUES (?, ?, ?, ?)",
+            [
+                (1, 10, 0, 2),
+                (2, 10, 1, 3),
+                (3, 10, 0, 1),
+                (4, 20, 0, 1),
+                (5, 20, 0, 2),
+                (6, 30, 1, 2),
+                (7, 30, 0, 3),
+            ],
+        )
+        # Card u1 has French + German; Card u2 has German + Spanish (1/4 = 25%,
+        # whereas LEFT JOIN ... AND language='French' gives 1/2 = 50%!).
+        conn.executemany(
+            "INSERT INTO cards VALUES (?, ?, ?)", [(1, "u1", 1), (2, "u2", 1)]
+        )
+        conn.executemany(
+            "INSERT INTO foreign_data VALUES (?, ?, ?)",
+            [
+                (1, "u1", "French"),
+                (2, "u1", "German"),
+                (3, "u2", "German"),
+                (4, "u2", "Spanish"),
+            ],
+        )
+        conn.commit()
+      finally:
+        conn.close()
+
+      schema = DatabaseSchema(
+          db_id="rel_traps",
+          tables=(
+              TableSchema(
+                  "Team",
+                  (
+                      ColumnSchema("id", "INTEGER", is_primary_key=True),
+                      ColumnSchema("team_api_id", "INTEGER"),
+                      ColumnSchema("team_long_name", "TEXT"),
+                  ),
+              ),
+              TableSchema(
+                  "Match",
+                  (
+                      ColumnSchema("id", "INTEGER", is_primary_key=True),
+                      ColumnSchema("away_team_api_id", "INTEGER"),
+                      ColumnSchema("home_team_goal", "INTEGER"),
+                      ColumnSchema("away_team_goal", "INTEGER"),
+                  ),
+              ),
+              TableSchema(
+                  "cards",
+                  (
+                      ColumnSchema("id", "INTEGER", is_primary_key=True),
+                      ColumnSchema("uuid", "TEXT"),
+                      ColumnSchema("isStorySpotlight", "INTEGER"),
+                  ),
+              ),
+              TableSchema(
+                  "foreign_data",
+                  (
+                      ColumnSchema("id", "INTEGER", is_primary_key=True),
+                      ColumnSchema("uuid", "TEXT"),
+                      ColumnSchema("language", "TEXT"),
+                  ),
+              ),
+          ),
+          foreign_keys=(
+              ForeignKeyEdge("Match", "away_team_api_id", "Team", "team_api_id"),
+              ForeignKeyEdge("foreign_data", "uuid", "cards", "uuid"),
+          ),
+      )
+      sandbox = SQLiteReadOnlySandbox(SandboxPolicy(allowed_db_root=root))
+      argus = ArgusSQLPipeline(_RelationalTrapMockLLM(), sandbox)
+
+      # 1. Zero-token `NON_KEY_ENTITY_GROUPING` repair recovers `'Rangers'`!
+      t_team = NLQueryTask(
+          "1028",
+          "rel_traps",
+          "Which away team won the most during the 2010 season?",
+          "",
+          QueryDifficulty.CHALLENGING,
+      )
+      p_team = argus.predict(t_team, schema, db_file)
+      self.assertIn("GROUP BY M.away_team_api_id", p_team.final_sql)
+      self.assertEqual(sandbox.execute(db_file, p_team.final_sql).rows, (("Rangers",),))
+      # Zero Stage 4b LLM repair tokens spent (pure K=3 = 3 * 105 = 315 tokens)!
+      self.assertEqual(p_team.total_tokens, 315)
+
+      # 2. 1:N `LEFT_JOIN_FILTERED_RATIO` escalates to Stage 4b and recovers 25.0%!
+      t_pct = NLQueryTask(
+          "371",
+          "rel_traps",
+          "What is the percentage of French cards among Story Spotlight cards?",
+          "Story Spotlight refers to isStorySpotlight = 1",
+          QueryDifficulty.CHALLENGING,
+      )
+      p_pct = argus.predict(t_pct, schema, db_file)
+      self.assertEqual(sandbox.execute(db_file, p_pct.final_sql).rows, ((25.0,),))
+
 
 if __name__ == "__main__":
   unittest.main()

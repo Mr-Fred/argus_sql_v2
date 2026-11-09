@@ -11,6 +11,7 @@ import re
 from argus_sql.contracts.types import InvariantIssue
 from argus_sql.contracts.types import LinkedSchemaContext
 from argus_sql.contracts.types import SQLCandidate
+from argus_sql.verification.relational_invariants import find_entity_name_grouping_rewrite
 
 # Atomic SQL token inside function arguments or parenthesized arithmetic groups.
 _INNER_ATOM = (
@@ -227,6 +228,13 @@ def apply_algebraic_sql_repairs(
     repaired = re.sub(
         r"^SELECT\s+", "SELECT DISTINCT ", repaired, count=1, flags=re.IGNORECASE
     )
+
+  # 5. Rewrite `GROUP BY <alias>.<name>` to its unique equi-join entity ID key.
+  if "NON_KEY_ENTITY_GROUPING" in issue_codes:
+    gb_rw = find_entity_name_grouping_rewrite(repaired)
+    if gb_rw is not None:
+      gb_start, gb_end, _, target_key = gb_rw
+      repaired = f"{repaired[:gb_start]}{target_key}{repaired[gb_end:]}"
 
   # Return None when rewrites produced no diff to avoid duplicate sandbox runs.
   if repaired == candidate.sql.strip().rstrip(";"):

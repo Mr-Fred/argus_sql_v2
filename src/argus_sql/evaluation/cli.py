@@ -157,6 +157,14 @@ def main(argv: Sequence[str] | None = None) -> int:
       help="Directory for incremental per-task JSONL checkpoints (`results/live_runs`).",
   )
   parser.add_argument(
+      "--recompute-argus", action="store_true",
+      help="Evict cached Argus-SQL entries so updated Argus-SQL runs fresh against B0..B3.",
+  )
+  parser.add_argument(
+      "--fresh-checkpoint", action="store_true",
+      help="Clear existing checkpoint file before running to re-evaluate all systems.",
+  )
+  parser.add_argument(
       "--latex-out-dir", type=pathlib.Path, default=pathlib.Path("paper/tables"),
       help="Directory where generated `.tex` booktabs tables are saved.",
   )
@@ -299,6 +307,10 @@ def main(argv: Sequence[str] | None = None) -> int:
       stratified=args.stratified,
   )
   checkpointer = LiveRunCheckpointer(ckpt_path)
+  if args.fresh_checkpoint:
+    checkpointer.clear_all()
+  elif args.recompute_argus:
+    checkpointer.invalidate_system("Argus-SQL")
 
   # Support `--only-argus` for rapid low-token smoke checks on live endpoints.
   pipes: tuple[NL2SQLPipeline, ...] = (

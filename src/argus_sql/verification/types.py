@@ -21,8 +21,9 @@ class VerifierConfig:
   enable_semantic_invariants: bool = True
   enable_algebraic_repair: bool = True
   error_issue_multiplier: float = 0.18
-  warning_issue_multiplier: float = 0.65
-  # Small diversity bonus (`0.15`) breaks ties across error-free strategies.
+  # `0.48` ensures 1 invariant-clean candidate (1.00) beats 2 WARNINGs (0.96).
+  warning_issue_multiplier: float = 0.48
+  # Small diversity bonus (`0.15`) breaks ties across issue-free strategies.
   strategy_diversity_bonus: float = 0.15
 
 
