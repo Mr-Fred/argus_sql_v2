@@ -92,8 +92,8 @@ PYTHONPATH=src python3 -m argus_sql.evaluation.cli --mode diagnostic
   # Edit `.env` (set GOOGLE_CLOUD_PROJECT + run `gcloud auth application-default login`,
   # OR set ARGUS_LLM_API_KEY in `.env`), then run a 20-query smoke slice or full split:
   .\scripts\run_personal_eval.ps1 -Limit 20 -OnlyArgus
-  # Or run full B0..B3 + Argus-SQL evaluation:
-  .\scripts\run_personal_eval.ps1
+  # Full stratified B0..B3 + Argus-SQL evaluation (or -RecomputeArgus after code updates):
+  .\scripts\run_personal_eval.ps1 -RecomputeArgus
   ```
 
 - **macOS / Linux / Remote Linux VM (Bash)**:
@@ -102,8 +102,8 @@ PYTHONPATH=src python3 -m argus_sql.evaluation.cli --mode diagnostic
   cp config/personal_env.example .env
   # On a headless Linux VM, authenticate via `gcloud auth application-default login --no-launch-browser`
   ARGUS_LIMIT=20 ./scripts/run_personal_eval.sh --only-argus
-  # Or run full B0..B3 + Argus-SQL evaluation:
-  ./scripts/run_personal_eval.sh
+  # Full stratified B0..B3 + Argus-SQL evaluation (reuses cached B0..B3 checkpoints):
+  ./scripts/run_personal_eval.sh --recompute-argus
   ```
 
 This automatically scrubs Windows/POSIX machine paths, verifies clean-room safety, and writes:

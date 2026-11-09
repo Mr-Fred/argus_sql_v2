@@ -26,8 +26,13 @@ param(
     [string]$Provider = $(if ($env:ARGUS_PROVIDER) { $env:ARGUS_PROVIDER } else { "auto" }),
     [string]$Model = $(if ($env:ARGUS_MODEL) { $env:ARGUS_MODEL } elseif ($env:ARGUS_LLM_MODEL) { $env:ARGUS_LLM_MODEL } else { "auto" }),
     [ValidateRange(0, 1000000)]
-    [int]$Limit = $(if ($env:ARGUS_LIMIT) { [int]$env:ARGUS_LIMIT } else { 0 }),
+    [int]$Limit = $(if ($env:ARGUS_LIMIT) { [int]$env:ARGUS_LIMIT } else { 22 }),
+    [ValidateRange(1, 64)]
+    [int]$Concurrency = $(if ($env:ARGUS_CONCURRENCY) { [int]$env:ARGUS_CONCURRENCY } else { 16 }),
+    [bool]$Stratified = $(if ($env:ARGUS_STRATIFIED -in @("0", "false", "False")) { $false } else { $true }),
     [switch]$OnlyArgus,
+    [switch]$RecomputeArgus,
+    [switch]$FreshCheckpoint,
     [Parameter(ValueFromRemainingArguments = $true)]
     [string[]]$ExtraArgs = @()
 )
@@ -126,6 +131,7 @@ try {
         throw "[ERROR] BIRD dataset directory '$BirdDir' not found. Extract MINIDEV.zip into '$BirdDir' or pass -BirdDir."
     }
 
+    $CheckpointDir = Join-Path $RepoRoot "results/live_runs"
     $LatexOutDir = Join-Path $RepoRoot "paper/tables"
     $FeedbackOutDir = Join-Path $RepoRoot "results/feedback"
     $EvalArgs = @(
@@ -136,9 +142,20 @@ try {
         "--provider", $Provider,
         "--model", $Model,
         "--limit", "$Limit",
+        "--task-concurrency", "$Concurrency",
+        "--checkpoint-dir", $CheckpointDir,
         "--latex-out-dir", $LatexOutDir,
         "--feedback-out-dir", $FeedbackOutDir
     )
+    if ($Stratified -and ($ExtraArgs -notcontains "--stratified")) {
+        $EvalArgs += "--stratified"
+    }
+    if (($RecomputeArgus -or ($env:ARGUS_RECOMPUTE_ARGUS -in @("1", "true", "True"))) -and ($ExtraArgs -notcontains "--recompute-argus")) {
+        $EvalArgs += "--recompute-argus"
+    }
+    if (($FreshCheckpoint -or ($env:ARGUS_FRESH_CHECKPOINT -in @("1", "true", "True"))) -and ($ExtraArgs -notcontains "--fresh-checkpoint")) {
+        $EvalArgs += "--fresh-checkpoint"
+    }
     if ($OnlyArgus -and ($ExtraArgs -notcontains "--only-argus")) {
         $EvalArgs += "--only-argus"
     }
@@ -146,7 +163,7 @@ try {
         $EvalArgs += $ExtraArgs
     }
 
-    Write-Host "[2/4] Running live BIRD-SQL evaluation (provider=$Provider, model=$Model, limit=$Limit)..."
+    Write-Host "[2/4] Running live BIRD-SQL evaluation (provider=$Provider, model=$Model, limit=$Limit, concurrency=$Concurrency, stratified=$Stratified)..."
     Invoke-ArgusPython -PythonSpec $PySpec -Arguments $EvalArgs
 
     Write-Host "[3/4] Scanning exported feedback bundle & LaTeX table for zero leaks..."

@@ -78,17 +78,17 @@ On your **personal Windows PC (inside Antigravity IDE or PowerShell)** or macOS/
      # If using Vertex AI on Windows, authenticate locally (writes %APPDATA%\gcloud\application_default_credentials.json):
      gcloud auth application-default login
      ```
-   - Run a fast 20-query smoke slice first, then the full 500-query `bird_mini_dev` split:
+   - Run a fast 20-query smoke slice first, then the comparative `bird_mini_dev` split (`-RecomputeArgus` evicts stale `Argus-SQL` JSONL checkpoint rows in `results/live_runs/` while reusing cached `B0..B3` baselines):
      ```powershell
      # Fast 20-query smoke check on Windows PowerShell:
-     .\scripts\run_personal_eval.ps1 -Limit 20 -OnlyArgus
+     .\scripts\run_personal_eval.ps1 -Limit 20 -OnlyArgus -RecomputeArgus
 
-     # Full comparative evaluation (B0..B3 + Argus-SQL on Clean + Voice-BIRD):
-     .\scripts\run_personal_eval.ps1
+     # Stratified comparative evaluation (B0..B3 + fresh Argus-SQL on Clean + Voice-BIRD):
+     .\scripts\run_personal_eval.ps1 -RecomputeArgus
      ```
    - **Copy-Paste Prompt for Your Windows Antigravity Agent** (after setting `.env` / `gcloud` locally):
      ```text
-     Read docs/CICD_SPLIT_WORKFLOW.md and AGENTS.md. Verify that data/bird/mini_dev is unpacked and local .env / gcloud ADC is ready on GOOGLE_CLOUD_LOCATION=global using gemini-3.7-flash (never print secret values). Run .\scripts\run_personal_eval.ps1 -Limit 20 -OnlyArgus first to validate live connectivity and inspect results/feedback/triage_report.md. Once verified, run the full evaluation (.\scripts\run_personal_eval.ps1), confirm zero clean-room leaks and valid SHA-256 signatures, and commit/push ONLY results/feedback/bird_feedback_bundle.json, results/feedback/triage_report.md, and paper/tables/bird_live.tex to main.
+     Read docs/CICD_SPLIT_WORKFLOW.md and AGENTS.md. Verify that data/bird/mini_dev is unpacked and local .env / gcloud ADC is ready on GOOGLE_CLOUD_LOCATION=global using gemini-3.7-flash (never print secret values). Run .\scripts\run_personal_eval.ps1 -RecomputeArgus (or -FreshCheckpoint if prompts changed for all systems), confirm zero clean-room leaks and valid SHA-256 signatures, and commit/push ONLY results/feedback/bird_feedback_bundle.json, results/feedback/triage_report.md, and paper/tables/bird_live.tex to main.
      ```
 
 2. **Antigravity Remote Linux VM / macOS / POSIX Bash** — Native Linux commands (often faster for downloading the 1.3 GB BIRD SQLite archive directly over VM cloud bandwidth):
@@ -101,13 +101,14 @@ On your **personal Windows PC (inside Antigravity IDE or PowerShell)** or macOS/
    # 2. On a headless remote Linux VM, use --no-launch-browser for personal ADC:
    gcloud auth application-default login --no-launch-browser
 
-   # 3. Run a 20-query smoke slice first, then the full 500-query Mini-Dev split:
-   ARGUS_LIMIT=20 ./scripts/run_personal_eval.sh --only-argus
-   ./scripts/run_personal_eval.sh
+   # 3. Run stratified comparative slice (--recompute-argus refreshes Argus-SQL against cached B0..B3):
+   ./scripts/run_personal_eval.sh --recompute-argus
+   # Or run full 500-query split across 10-minute VM windows (auto-resumes via results/live_runs/):
+   ARGUS_LIMIT=0 ./scripts/run_personal_eval.sh --recompute-argus
    ```
    - **Copy-Paste Prompt for Your Antigravity Remote Linux VM Agent**:
      ```text
-     Read docs/CICD_SPLIT_WORKFLOW.md and AGENTS.md. Verify that data/bird/mini_dev (mini_dev_sqlite.json, dev_tables.json, and dev_databases/*.sqlite) is staged and local .env / gcloud ADC is ready on GOOGLE_CLOUD_LOCATION=global using gemini-3.7-flash (never print secret values). Run `ARGUS_LIMIT=20 ./scripts/run_personal_eval.sh --only-argus` first to validate live connectivity and inspect results/feedback/triage_report.md. Once verified, run the full evaluation (`./scripts/run_personal_eval.sh`), confirm zero clean-room leaks and valid SHA-256 signatures, and commit/push ONLY results/feedback/bird_feedback_bundle.json, results/feedback/triage_report.md, and paper/tables/bird_live.tex to main.
+     Read docs/CICD_SPLIT_WORKFLOW.md and AGENTS.md. Pull latest origin/main and verify that data/bird/mini_dev (mini_dev_sqlite.json, dev_tables.json, and dev_databases/*.sqlite) is staged and local .env / gcloud ADC is ready on GOOGLE_CLOUD_LOCATION=global using gemini-3.7-flash (never print secret values). Run `./scripts/run_personal_eval.sh --recompute-argus` to re-evaluate updated Argus-SQL against the stratified 11-DB checkpoint (or `--fresh-checkpoint` to recompute all 5 systems), confirm zero clean-room leaks and valid SHA-256 signatures, and commit/push ONLY results/feedback/bird_feedback_bundle.json, results/feedback/triage_report.md, and paper/tables/bird_live.tex to main.
      ```
 
 3. `run_personal_eval.ps1` / `run_personal_eval.sh` automatically:

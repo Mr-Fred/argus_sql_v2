@@ -412,19 +412,30 @@ class VerificationAndArbiterTest(unittest.TestCase):
     )
     self.assertEqual(lj_win.candidate.sql, clean_ij.sql)
 
-    # 1:0..1 PK-joined `satscores (cds PRIMARY KEY)` must NOT false-alarm!
+    # 1:0..1 PK-joined `satscores (cds PRIMARY KEY)` (including reversed/lower `and`)
+    # and deduplicated window-function CTEs (`WITH latest AS (...)`) must NOT alarm!
     pk_lj = SQLCandidate(
         "SELECT CAST(COUNT(T2.cds) AS REAL) / COUNT(T1.id) FROM cards T1 "
-        "LEFT JOIN satscores T2 ON T1.uuid = T2.cds AND T2.AvgScrMath > 500",
+        "LEFT JOIN satscores T2 ON T2.AvgScrMath > 500 and T1.uuid = T2.cds",
+        "cot",
+    )
+    cte_lj = SQLCandidate(
+        "WITH latest AS (SELECT uuid, ROW_NUMBER() OVER (PARTITION BY uuid) AS rn "
+        "FROM foreign_data) SELECT 100.0 * SUM(CASE WHEN l.rn = 1 THEN 1 ELSE 0 END) "
+        "/ COUNT(c.id) FROM cards c LEFT JOIN latest l ON l.uuid = c.uuid AND l.rn = 1",
         "cot",
     )
     self.assertEqual(
         audit_candidate_invariants(pk_lj, good_out, pct_intent, linked_cards), ()
     )
+    self.assertEqual(
+        audit_candidate_invariants(cte_lj, good_out, pct_intent, linked_cards), ()
+    )
 
-    # 2. `GROUP BY T.team_long_name` (and `GROUP BY T.team_api_id, T.team_long_name`)
-    #    rewrites algebraically to `GROUP BY M.away_team_api_id` at 0 token cost,
-    #    and 1 clean entity-key candidate (1.00) beats 2 name-grouped ones (0.96).
+    # 2. `GROUP BY T.team_long_name` (and `GROUP BY T.team_api_id, T.team_long_name`
+    #    or `GROUP BY T.team_long_name, T.team_api_id`) rewrites algebraically to
+    #    `GROUP BY M.away_team_api_id` without child-FK poisoning (`T.country_id`),
+    #    and skips intentional homonym `COUNT(DISTINCT d.driverId)` queries!
     win_intent = canonicalize_intent(
         "Which away team won the most during the 2010 season?"
     )
@@ -437,10 +448,17 @@ class VerificationAndArbiterTest(unittest.TestCase):
         "formula_defensive",
     )
     pair_gb = SQLCandidate(
-        "SELECT T.team_long_name FROM Match AS M "
-        "INNER JOIN Team AS T ON M.away_team_api_id = T.team_api_id "
-        "GROUP BY T.team_api_id, T.team_long_name ORDER BY COUNT(*) DESC LIMIT 1",
+        "SELECT T.team_long_name FROM Team AS T "
+        "INNER JOIN Country AS C ON T.country_id = C.id "
+        "INNER JOIN Match AS M ON T.team_api_id = M.away_team_api_id "
+        "GROUP BY T.team_long_name, T.team_api_id ORDER BY COUNT(*) DESC LIMIT 1",
         "decomposed_cot",
+    )
+    homonym_gb = SQLCandidate(
+        "SELECT d.forename, COUNT(DISTINCT d.driverId) AS n FROM results x "
+        "INNER JOIN drivers d ON x.driverId = d.driverId "
+        "GROUP BY d.forename HAVING COUNT(DISTINCT d.driverId) > 1",
+        "cot",
     )
     t_sig_a = compute_result_signature((("Celtic",),))
     t_sig_b = compute_result_signature((("Rangers",),))
@@ -457,6 +475,9 @@ class VerificationAndArbiterTest(unittest.TestCase):
     self.assertIsNotNone(pair_rep)
     assert pair_rep is not None
     self.assertIn("GROUP BY M.away_team_api_id ORDER BY", pair_rep.sql)
+    self.assertNotIn("GROUP BY T.country_id", pair_rep.sql)
+    hom_out = ExecutionOutcome(True, (("John", 2),), ("f", "n"), 1, 1.0, "", t_sig_a)
+    self.assertEqual(audit_candidate_invariants(homonym_gb, hom_out, win_intent), ())
 
     # Verify 1 clean entity-key candidate (1.00) outvotes 2 WARNING ones (0.96).
     gb_win, _, _ = verify_and_rank_candidates(

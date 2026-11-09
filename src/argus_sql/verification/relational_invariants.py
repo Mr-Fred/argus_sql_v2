@@ -150,27 +150,41 @@ def check_left_join_filtered_ratio(
     return None
 
   single_pks = _extract_ddl_single_pk_columns(ddl_prompt) if ddl_prompt else {}
+  # Collect CTE aliases (`WITH c1 AS (...), c2 AS (...)`) so deduplicated
+  # window-function CTEs (`LEFT JOIN latest ON ... AND rn = 1`) never false-alarm.
+  cte_names = {
+      c.lower()
+      for c in re.findall(
+          r"(?:\bWITH(?:\s+RECURSIVE)?|,)\s*([a-zA-Z_][a-zA-Z0-9_]*)\s+AS\s*\(",
+          no_strings_sql,
+          re.IGNORECASE,
+      )
+  }
   for lj_match in _LEFT_JOIN_ON_RE.finditer(no_strings_sql):
     raw_tbl = lj_match.group(1) or lj_match.group(2) or lj_match.group(3) or ""
     tbl_low = raw_tbl.replace('""', '"').replace("``", "`").lower()
+    if tbl_low in cte_names:
+      continue
     alias_low = (lj_match.group(4) or tbl_low).lower()
     on_clause = lj_match.group(5)
     if _ON_FILTER_PRED_RE.search(on_clause) is None:
       continue
 
-    # Check whether the joined table's ON column is its unique single-col PK
-    # (1-to-0..1 extension table, where LEFT JOIN does not fan out or collapse).
-    eq_cols = [
-        col.lower()
-        for qual, col in re.findall(
-            r"\b([a-zA-Z_][a-zA-Z0-9_]*)\.([a-zA-Z_][a-zA-Z0-9_]*)\b",
-            on_clause.split("AND")[0],
-        )
-        if qual.lower() in {alias_low, tbl_low}
-    ]
+    # Extract identifier-to-identifier equi-join columns on the joined table
+    # regardless of `AND` casing or predicate order (`1:0..1` PK extension check).
+    eq_cols: set[str] = set()
+    for q1, c1, q2, c2 in re.findall(
+        r"\b([a-zA-Z_]\w*)\.([a-zA-Z_]\w*)\s*=\s*([a-zA-Z_]\w*)\.([a-zA-Z_]\w*)\b",
+        on_clause,
+    ):
+      if q1.lower() in {alias_low, tbl_low}:
+        eq_cols.add(c1.lower())
+      if q2.lower() in {alias_low, tbl_low}:
+        eq_cols.add(c2.lower())
     if tbl_low in single_pks:
       pk_col = single_pks[tbl_low]
-      if pk_col is not None and eq_cols and eq_cols[0] == pk_col:
+      # 1-to-0..1 PK extension tables never fan out or distort parent counts.
+      if pk_col is not None and pk_col in eq_cols:
         continue
       severity = "ERROR"
     else:
@@ -220,9 +234,10 @@ def find_entity_name_grouping_rewrite(
   if re.search(r"\b(?:ORDER\s+BY|HAVING)\b", outer, re.IGNORECASE) is None:
     return None
 
-  # Index equi-join key expressions per table alias across top-level JOINs.
-  # Map `entity_alias_low -> preferred_join_key_expr` (preferring FK side).
-  alias_join_key: dict[str, str] = {}
+  # Track explicit parent-FK keys separately from symmetric same-name keys so a
+  # child FK (`Team.country_id = Country.id`) never poisons `Team`'s own key.
+  explicit_fk_key: dict[str, str] = {}
+  same_name_key: dict[str, str] = {}
   join_re = re.compile(
       r"\bJOIN\s+[a-zA-Z0-9_\s]+?\s+ON\s+"
       r"([a-zA-Z_][a-zA-Z0-9_]*)\.([a-zA-Z_][a-zA-Z0-9_]*)\s*=\s*"
@@ -231,35 +246,38 @@ def find_entity_name_grouping_rewrite(
       re.IGNORECASE,
   )
   for jm in join_re.finditer(outer):
-    a_lhs, c_lhs, a_rhs, c_rhs = (
-        jm.group(1),
-        jm.group(2),
-        jm.group(3),
-        jm.group(4),
-    )
+    a_lhs, c_lhs, a_rhs, c_rhs = jm.groups()
     if not (_is_key_identifier(c_lhs) and _is_key_identifier(c_rhs)):
       continue
-    # Prefer the longer/more specific FK identifier (`M.away_team_api_id`) when
-    # equal on every INNER JOIN row; fall back to each alias's own key column.
-    is_left = (
-        re.search(
-            r"\bLEFT\s+(?:OUTER\s+)?$",
-            outer[: jm.start()],
-            re.IGNORECASE,
-        )
-        is not None
+    # Preserve outer-table key expression on LEFT JOIN so NULLs cannot merge.
+    is_left = bool(
+        re.search(r"\bLEFT\s+(?:OUTER\s+)?$", outer[: jm.start()], re.IGNORECASE)
     )
-    fk_pref = (
-        f"{a_lhs}.{c_lhs}" if len(c_lhs) >= len(c_rhs) else f"{a_rhs}.{c_rhs}"
-    )
-    alias_join_key.setdefault(
-        a_lhs.lower(), f"{a_lhs}.{c_lhs}" if is_left else fk_pref
-    )
-    alias_join_key.setdefault(
-        a_rhs.lower(), f"{a_rhs}.{c_rhs}" if is_left else fk_pref
-    )
+    low_l, low_r = c_lhs.lower(), c_rhs.lower()
+    if low_l == low_r:
+      # Identical key names (`driverId = driverId`) identify both joined sides.
+      shared_expr = f"{a_lhs}.{c_lhs}"
+      same_name_key.setdefault(a_lhs.lower(), f"{a_lhs}.{c_lhs}" if is_left else shared_expr)
+      same_name_key.setdefault(a_rhs.lower(), f"{a_rhs}.{c_rhs}" if is_left else shared_expr)
+    elif len(low_l) != len(low_r):
+      # Shorter key side is the referenced parent entity; longer side holds FK.
+      a_sh, c_sh, a_lg, c_lg = (
+          (a_lhs, c_lhs, a_rhs, c_rhs)
+          if len(low_l) < len(low_r)
+          else (a_rhs, c_rhs, a_lhs, c_lhs)
+      )
+      low_sh, low_lg = c_sh.lower(), c_lg.lower()
+      # Require prefix/suffix stem alignment (`away_team_api_id` -> `team_api_id`).
+      if not (low_lg.endswith(low_sh) or low_lg.startswith(low_sh)):
+        continue
+      fk_expr = f"{a_sh}.{c_sh}" if is_left else f"{a_lg}.{c_lg}"
+      explicit_fk_key.setdefault(a_sh.lower(), fk_expr)
+      # Support 1:1 code variants (`cds` <-> `CDSCode`) without child FK leakage.
+      if low_lg == f"{low_sh}code":
+        same_name_key.setdefault(a_lg.lower(), f"{a_lg}.{c_lg}" if is_left else fk_expr)
 
-  # Abort when no equi-join key pair was observed across top-level JOINs.
+  # Explicit parent-FK bindings override symmetric fallback bindings.
+  alias_join_key = {**same_name_key, **explicit_fk_key}
   if not alias_join_key:
     return None
 
@@ -273,42 +291,49 @@ def find_entity_name_grouping_rewrite(
   if gb_match is None:
     return None
 
-  # Extract raw `GROUP BY` items while preserving trailing newline spacing.
+  # Extract qualified `(alias, name_col)` from single or 2-item `GROUP BY` list.
   gb_start, gb_end = gb_match.start(1), gb_match.end(1)
   raw_gb = sql_text[gb_start:gb_end].strip()
   parts = [p.strip() for p in raw_gb.split(",") if p.strip()]
+  qual_re = re.compile(r"([a-zA-Z_][a-zA-Z0-9_]*)\.([a-zA-Z_][a-zA-Z0-9_]*)")
+  ent_alias: str | None = None
   if len(parts) == 1:
-    # Single-column `GROUP BY T.team_long_name` on an equi-joined entity table.
-    col_m = re.fullmatch(
-        r"([a-zA-Z_][a-zA-Z0-9_]*)\.([a-zA-Z_][a-zA-Z0-9_]*)", parts[0]
-    )
+    m_one = qual_re.fullmatch(parts[0])
     if (
-        col_m is not None
-        and col_m.group(1).lower() in alias_join_key
-        and _ENTITY_NAME_COL_RE.fullmatch(col_m.group(2))
+        m_one is not None
+        and m_one.group(1).lower() in alias_join_key
+        and _ENTITY_NAME_COL_RE.fullmatch(m_one.group(2))
     ):
-      target_key = alias_join_key[col_m.group(1).lower()]
-      trim_end = gb_start + len(sql_text[gb_start:gb_end].rstrip())
-      return (gb_start, trim_end, raw_gb, target_key)
+      ent_alias = m_one.group(1)
   elif len(parts) == 2:
-    # Handle `GROUP BY T.team_api_id, T.team_long_name` compound grouping.
-    m0 = re.fullmatch(
-        r"([a-zA-Z_][a-zA-Z0-9_]*)\.([a-zA-Z_][a-zA-Z0-9_]*)", parts[0]
-    )
-    m1 = re.fullmatch(
-        r"([a-zA-Z_][a-zA-Z0-9_]*)\.([a-zA-Z_][a-zA-Z0-9_]*)", parts[1]
-    )
-    if (
-        m0 is not None
-        and m1 is not None
-        and _is_key_identifier(m0.group(2))
-        and m1.group(1).lower() in alias_join_key
-        and _ENTITY_NAME_COL_RE.fullmatch(m1.group(2))
-    ):
-      target_key = alias_join_key[m1.group(1).lower()]
-      trim_end = gb_start + len(sql_text[gb_start:gb_end].rstrip())
-      return (gb_start, trim_end, raw_gb, target_key)
-  return None
+    # Support both `(id, name)` and `(name, id)` compound `GROUP BY` orderings.
+    m0, m1 = qual_re.fullmatch(parts[0]), qual_re.fullmatch(parts[1])
+    if m0 is not None and m1 is not None:
+      for m_key, m_name in ((m0, m1), (m1, m0)):
+        if (
+            _is_key_identifier(m_key.group(2))
+            and m_name.group(1).lower() in alias_join_key
+            and _ENTITY_NAME_COL_RE.fullmatch(m_name.group(2))
+        ):
+          ent_alias = m_name.group(1)
+          break
+
+  if ent_alias is None:
+    return None
+  target_key = alias_join_key[ent_alias.lower()]
+  # Never rewrite queries intentionally counting distinct entities per homonym
+  # (`SELECT d.forename, COUNT(DISTINCT d.driverId) ... GROUP BY d.forename`).
+  key_col = target_key.split(".")[-1]
+  distinct_pat = rf"\bCOUNT\s*\(\s*DISTINCT\s+(?:{re.escape(ent_alias)}\.\w+"
+  if key_col.lower() != "id":
+    distinct_pat += rf"|(?:[a-zA-Z_]\w*\.)?{re.escape(key_col)}\b"
+  distinct_pat += r")"
+  if re.search(distinct_pat, sql_text, re.IGNORECASE):
+    return None
+
+  # Preserve any trailing whitespace/newlines before `ORDER BY` or `HAVING`.
+  trim_end = gb_start + len(sql_text[gb_start:gb_end].rstrip())
+  return (gb_start, trim_end, raw_gb, target_key)
 
 
 def check_non_key_entity_grouping(sql_text: str) -> InvariantIssue | None:

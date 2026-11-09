@@ -36,10 +36,18 @@ MODEL="${ARGUS_MODEL:-${ARGUS_LLM_MODEL:-auto}}"
 LIMIT="${ARGUS_LIMIT:-22}"
 CONCURRENCY="${ARGUS_CONCURRENCY:-16}"
 STRATIFIED="${ARGUS_STRATIFIED:-1}"
+RECOMPUTE_ARGUS="${ARGUS_RECOMPUTE_ARGUS:-0}"
+FRESH_CHECKPOINT="${ARGUS_FRESH_CHECKPOINT:-0}"
 
-STRAT_FLAG=()
+CLI_FLAGS=()
 if [ "${STRATIFIED}" = "1" ] || [ "${STRATIFIED}" = "true" ]; then
-  STRAT_FLAG=(--stratified)
+  CLI_FLAGS+=(--stratified)
+fi
+if [ "${RECOMPUTE_ARGUS}" = "1" ] || [ "${RECOMPUTE_ARGUS}" = "true" ]; then
+  CLI_FLAGS+=(--recompute-argus)
+fi
+if [ "${FRESH_CHECKPOINT}" = "1" ] || [ "${FRESH_CHECKPOINT}" = "true" ]; then
+  CLI_FLAGS+=(--fresh-checkpoint)
 fi
 
 echo "[1/4] Bootstrapping local clean-room Git hooks..."
@@ -63,7 +71,7 @@ run_py -m argus_sql.evaluation.cli \
   --checkpoint-dir "${REPO_ROOT}/results/live_runs" \
   --latex-out-dir "${REPO_ROOT}/paper/tables" \
   --feedback-out-dir "${REPO_ROOT}/results/feedback" \
-  "${STRAT_FLAG[@]}" \
+  ${CLI_FLAGS[@]+"${CLI_FLAGS[@]}"} \
   "$@"
 
 echo "[3/4] Scanning exported feedback bundle & LaTeX table for zero leaks..."
