@@ -245,11 +245,11 @@ class CleanRoomScannerTest(unittest.TestCase):
           (
               '{\n'
               '  "healthy_min_lines": 80,\n'
-              '  "healthy_max_lines": 400,\n'
-              '  "ceiling_max_lines": 600,\n'
+              '  "healthy_max_lines": 800,\n'
+              '  "ceiling_max_lines": 1000,\n'
               '  "min_comment_ratio": 0.08,\n'
               '  "file_max_lines_overrides": {\n'
-              '    "pkg/exempt.py": 650,\n'
+              '    "pkg/exempt.py": 1050,\n'
               '    "pkg/strict.py": 250\n'
               '  }\n'
               '}\n'
@@ -257,21 +257,21 @@ class CleanRoomScannerTest(unittest.TestCase):
           encoding="utf-8",
       )
       policy = load_compliance_policy(repo)
-      self.assertEqual(policy.healthy_max_lines, 400)
-      self.assertEqual(policy.ceiling_max_lines, 600)
-      self.assertEqual(policy.override_for("pkg/exempt.py"), 650)
+      self.assertEqual(policy.healthy_max_lines, 800)
+      self.assertEqual(policy.ceiling_max_lines, 1000)
+      self.assertEqual(policy.override_for("pkg/exempt.py"), 1050)
       self.assertEqual(policy.override_for("pkg/strict.py"), 250)
 
       pkg_dir = repo / "pkg"
       pkg_dir.mkdir()
-      # Exact boundary 400 executable lines: inside healthy range (0 size findings).
+      # Exact boundary 800 executable lines: inside healthy range (0 size findings).
       healthy_mod = pkg_dir / "healthy.py"
-      healthy_mod.write_text(_build_module_with_exec_lines(400), encoding="utf-8")
+      healthy_mod.write_text(_build_module_with_exec_lines(800), encoding="utf-8")
       self.assertEqual(verify_python_ast_quality(healthy_mod), ())
 
-      # 450 executable lines: in advisory zone (WARNING only, CLI exits 0).
+      # 850 executable lines: in advisory zone (WARNING only, CLI exits 0).
       stretch_mod = pkg_dir / "stretch.py"
-      stretch_mod.write_text(_build_module_with_exec_lines(450), encoding="utf-8")
+      stretch_mod.write_text(_build_module_with_exec_lines(850), encoding="utf-8")
       stretch_viols = verify_python_ast_quality(stretch_mod)
       self.assertEqual(len(stretch_viols), 1)
       self.assertEqual(stretch_viols[0].rule_id, "AST-SIZE-ADVISORY")
@@ -293,9 +293,9 @@ class CleanRoomScannerTest(unittest.TestCase):
       self.assertIn("[PASS]", out_buf.getvalue())
       self.assertEqual(err_buf.getvalue(), "")
 
-      # 620 executable lines with override at 650 passes; without override fails.
+      # 1020 executable lines with override at 1050 passes; without override fails.
       exempt_mod = pkg_dir / "exempt.py"
-      exempt_mod.write_text(_build_module_with_exec_lines(620), encoding="utf-8")
+      exempt_mod.write_text(_build_module_with_exec_lines(1020), encoding="utf-8")
       self.assertTrue(run_repository_audit(repo).passed)
 
       # Stricter per-file override (250) rejects a 280-line module cleanly.
@@ -309,9 +309,14 @@ class CleanRoomScannerTest(unittest.TestCase):
       )
       strict_mod.unlink()
 
-      # Exact global ceiling (600) stays advisory; 601 fails AST-MAX-LINES.
+      # Exact global ceiling (1000) stays advisory; 1001 fails AST-MAX-LINES.
       bloat_mod = pkg_dir / "bloat.py"
-      bloat_mod.write_text(_build_module_with_exec_lines(601), encoding="utf-8")
+      bloat_mod.write_text(_build_module_with_exec_lines(1000), encoding="utf-8")
+      ceiling_viols = verify_python_ast_quality(bloat_mod)
+      self.assertEqual(len(ceiling_viols), 1)
+      self.assertEqual(ceiling_viols[0].rule_id, "AST-SIZE-ADVISORY")
+      self.assertEqual(ceiling_viols[0].severity, "WARNING")
+      bloat_mod.write_text(_build_module_with_exec_lines(1001), encoding="utf-8")
       bloat_viols = verify_python_ast_quality(bloat_mod)
       self.assertEqual(bloat_viols[0].rule_id, "AST-MAX-LINES")
       self.assertEqual(bloat_viols[0].severity, "ERROR")
@@ -329,7 +334,7 @@ class CleanRoomScannerTest(unittest.TestCase):
       )
       legacy_policy = load_compliance_policy(repo)
       self.assertEqual(legacy_policy.healthy_max_lines, 320)
-      self.assertEqual(legacy_policy.ceiling_max_lines, 600)
+      self.assertEqual(legacy_policy.ceiling_max_lines, 1000)
 
       # Malformed types, bools, negative numbers, and bad overrides fall back.
       (repo / ".copilot_compliance.json").write_text(
@@ -342,18 +347,18 @@ class CleanRoomScannerTest(unittest.TestCase):
               '  "file_max_lines_overrides": {\n'
               '    "bad_bool.py": true,\n'
               '    "bad_neg.py": -5,\n'
-              '    "ok.py": 500\n'
+              '    "ok.py": 900\n'
               '  }\n'
               '}\n'
           ),
           encoding="utf-8",
       )
       safe_policy = load_compliance_policy(repo)
-      self.assertEqual(safe_policy.healthy_max_lines, 400)
-      self.assertEqual(safe_policy.healthy_min_lines, 400)
-      self.assertEqual(safe_policy.ceiling_max_lines, 600)
+      self.assertEqual(safe_policy.healthy_max_lines, 800)
+      self.assertEqual(safe_policy.healthy_min_lines, 800)
+      self.assertEqual(safe_policy.ceiling_max_lines, 1000)
       self.assertEqual(safe_policy.min_comment_ratio, 0.08)
-      self.assertEqual(safe_policy.file_max_lines_overrides, (("ok.py", 500),))
+      self.assertEqual(safe_policy.file_max_lines_overrides, (("ok.py", 900),))
 
 
 

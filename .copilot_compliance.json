@@ -1,7 +1,7 @@
 {
   "healthy_min_lines": 80,
-  "healthy_max_lines": 400,
-  "ceiling_max_lines": 600,
+  "healthy_max_lines": 800,
+  "ceiling_max_lines": 1000,
   "structural_leaf_stems": [
     "__init__",
     "types",

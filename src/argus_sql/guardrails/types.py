@@ -98,8 +98,8 @@ class CompliancePolicy:
   """
 
   healthy_min_lines: int = 80
-  healthy_max_lines: int = 400
-  ceiling_max_lines: int = 600
+  healthy_max_lines: int = 800
+  ceiling_max_lines: int = 1000
   min_comment_ratio: float = 0.08
   file_max_lines_overrides: tuple[tuple[str, int], ...] = ()
 

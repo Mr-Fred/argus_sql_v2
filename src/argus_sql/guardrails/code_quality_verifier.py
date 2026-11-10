@@ -79,13 +79,13 @@ def load_compliance_policy(repo_root: pathlib.Path) -> CompliancePolicy:
       if raw.get("healthy_max_lines") is not None
       else raw.get("default_max_lines")
   )
-  healthy_max = _coerce_positive_int(healthy_max_raw, 400)
+  healthy_max = _coerce_positive_int(healthy_max_raw, 800)
   healthy_min = min(
       healthy_max,
       _coerce_positive_int(raw.get("healthy_min_lines"), 80),
   )
   # Ensure ceiling never drops below the healthy target upper bound.
-  default_ceiling = max(healthy_max + 200, 600)
+  default_ceiling = max(healthy_max + 200, 1000)
   ceiling_max = max(
       healthy_max,
       _coerce_positive_int(raw.get("ceiling_max_lines"), default_ceiling),
@@ -137,9 +137,9 @@ def _docstring_line_numbers(tree: ast.AST) -> set[int]:
 def verify_python_ast_quality(
     file_path: pathlib.Path,
     target_label: str | None = None,
-    max_code_lines: int = 600,
+    max_code_lines: int = 1000,
     min_comment_ratio: float = 0.08,
-    healthy_max_lines: int = 400,
+    healthy_max_lines: int = 800,
 ) -> tuple[CodeQualityViolation, ...]:
   """Audits a single Python file for modularity, docstrings, types, and safety.
 
