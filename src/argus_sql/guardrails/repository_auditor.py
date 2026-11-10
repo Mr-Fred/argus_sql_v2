@@ -11,6 +11,7 @@ from argus_sql.guardrails.clean_room_scanner import iter_scannable_repo_files
 from argus_sql.guardrails.clean_room_scanner import scan_pdf_for_leaks
 from argus_sql.guardrails.clean_room_scanner import scan_text_for_leaks
 from argus_sql.guardrails.clean_room_scanner import verify_git_author_identity
+from argus_sql.guardrails.code_quality_verifier import load_compliance_policy
 from argus_sql.guardrails.code_quality_verifier import verify_python_ast_quality
 from argus_sql.guardrails.exceptions import GuardrailError
 from argus_sql.guardrails.hook_installer import verify_git_hooks_active
@@ -25,6 +26,7 @@ def _audit_file_list(
 ) -> tuple[tuple[LeakFinding, ...], tuple[CodeQualityViolation, ...]]:
   """Scans a resolved sequence of repository files for leaks and AST issues."""
   rules = build_default_leak_rules()
+  policy = load_compliance_policy(resolved_root)
   leak_findings: list[LeakFinding] = []
   quality_violations: list[CodeQualityViolation] = []
 
@@ -42,10 +44,28 @@ def _audit_file_list(
     except UnicodeDecodeError:
       continue
     leak_findings.extend(scan_text_for_leaks(text, rel_label, rules=rules))
-    # Run static Python AST checks on every `.py` source and test module.
+    # Run static Python AST checks using healthy-range and override policy.
     if file_path.suffix == ".py":
+      override_limit = policy.override_for(rel_label)
+      # Honor both higher exemptions and stricter per-file ceiling overrides.
+      ceiling = (
+          override_limit
+          if override_limit is not None
+          else policy.ceiling_max_lines
+      )
+      healthy_max = (
+          max(policy.healthy_max_lines, override_limit)
+          if override_limit is not None
+          else policy.healthy_max_lines
+      )
       quality_violations.extend(
-          verify_python_ast_quality(file_path, target_label=rel_label)
+          verify_python_ast_quality(
+              file_path,
+              target_label=rel_label,
+              max_code_lines=ceiling,
+              min_comment_ratio=policy.min_comment_ratio,
+              healthy_max_lines=healthy_max,
+          )
       )
   return tuple(leak_findings), tuple(quality_violations)
 

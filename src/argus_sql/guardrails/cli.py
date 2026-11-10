@@ -16,7 +16,13 @@ from argus_sql.guardrails.types import GuardrailAuditReport
 
 def _emit_audit_report(report: GuardrailAuditReport) -> int:
   """Prints audit status and returns 0 when clean or 1 on any violation."""
-  # Return zero immediately when every clean-room, Git, and AST check passed.
+  # Surface non-blocking healthy-range advisories on stdout even when passing.
+  for adv in report.advisory_quality_violations:
+    sys.stdout.write(
+        f"[WARN] [{adv.rule_id}] {adv.target}:{adv.line_number}: {adv.message}\n"
+    )
+
+  # Return zero immediately when every clean-room, Git, and blocking AST check passed.
   if report.passed:
     # Summarize scanned file count on stdout for CI job logs.
     sys.stdout.write(
@@ -24,7 +30,7 @@ def _emit_audit_report(report: GuardrailAuditReport) -> int:
     )
     return 0
 
-  # Emit actionable line-level diagnostics for any leak or AST violation.
+  # Emit actionable line-level diagnostics for any leak or blocking AST violation.
   sys.stderr.write(
       f"[FAIL] Guardrail audit failed across {report.scanned_files} files:\n"
   )
@@ -34,8 +40,8 @@ def _emit_audit_report(report: GuardrailAuditReport) -> int:
         f"  - [{finding.rule_id}] {finding.target}:{finding.line_number}: "
         f"{finding.description} -> {finding.redacted_preview}\n"
     )
-  # Report AST modularity, typing, docstring, and batch-safety violations next.
-  for viol in report.quality_violations:
+  # Report blocking AST modularity, typing, docstring, and batch-safety errors.
+  for viol in report.blocking_quality_violations:
     sys.stderr.write(
         f"  - [{viol.rule_id}] {viol.target}:{viol.line_number}: {viol.message}\n"
     )

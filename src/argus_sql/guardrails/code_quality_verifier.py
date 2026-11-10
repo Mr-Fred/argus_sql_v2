@@ -6,9 +6,11 @@ explicit exception handling, and batch-safe network execution.
 """
 
 import ast
+import json
 import pathlib
 
 from argus_sql.guardrails.types import CodeQualityViolation
+from argus_sql.guardrails.types import CompliancePolicy
 
 # HTTP client call names prohibited from sequential execution inside loops.
 _LOOP_HTTP_ATTRS: frozenset[str] = frozenset({
@@ -30,6 +32,86 @@ _LOGGER_METHODS: frozenset[str] = frozenset({
     "critical",
     "exception",
 })
+
+
+def _coerce_positive_int(value: object, default: int) -> int:
+  """Parses a strictly positive int from JSON while rejecting bool/null/strings."""
+  # Reject bool explicitly because bool subclasses int in Python.
+  if isinstance(value, bool) or not isinstance(value, (int, float)):
+    return default
+  parsed = int(value)
+  return parsed if parsed > 0 else default
+
+
+def _coerce_ratio(value: object, default: float) -> float:
+  """Parses a bounded [0.0, 1.0] comment ratio from JSON safely."""
+  if isinstance(value, bool) or not isinstance(value, (int, float)):
+    return default
+  parsed = float(value)
+  return parsed if 0.0 <= parsed <= 1.0 else default
+
+
+def load_compliance_policy(repo_root: pathlib.Path) -> CompliancePolicy:
+  """Loads healthy-range and comment thresholds from `.copilot_compliance.json`.
+
+  Args:
+    repo_root: Repository root containing optional `.copilot_compliance.json`.
+
+  Returns:
+    CompliancePolicy populated from JSON or safe architectural defaults.
+  """
+  policy_path = repo_root / ".copilot_compliance.json"
+  # Fall back to built-in healthy-range defaults when no config file exists.
+  if not policy_path.is_file():
+    return CompliancePolicy()
+  # Guard against transient I/O or malformed JSON edits so audits fail safely.
+  try:
+    raw = json.loads(policy_path.read_text(encoding="utf-8"))
+  except (OSError, ValueError):
+    return CompliancePolicy()
+  # Ignore non-object JSON payloads rather than crashing on schema mismatch.
+  if not isinstance(raw, dict):
+    return CompliancePolicy()
+
+  # Support both new healthy-range keys and legacy `default_max_lines` configs.
+  healthy_max_raw = (
+      raw.get("healthy_max_lines")
+      if raw.get("healthy_max_lines") is not None
+      else raw.get("default_max_lines")
+  )
+  healthy_max = _coerce_positive_int(healthy_max_raw, 400)
+  healthy_min = min(
+      healthy_max,
+      _coerce_positive_int(raw.get("healthy_min_lines"), 80),
+  )
+  # Ensure ceiling never drops below the healthy target upper bound.
+  default_ceiling = max(healthy_max + 200, 600)
+  ceiling_max = max(
+      healthy_max,
+      _coerce_positive_int(raw.get("ceiling_max_lines"), default_ceiling),
+  )
+  min_comment_ratio = _coerce_ratio(raw.get("min_comment_ratio"), 0.08)
+  raw_overrides = raw.get("file_max_lines_overrides", {})
+  overrides: tuple[tuple[str, int], ...] = ()
+  # Sort overrides deterministically so CompliancePolicy stays hashable and pure.
+  if isinstance(raw_overrides, dict):
+    overrides = tuple(
+        (k, int(v))
+        for k, v in sorted(raw_overrides.items())
+        if (
+            isinstance(k, str)
+            and not isinstance(v, bool)
+            and isinstance(v, (int, float))
+            and int(v) > 0
+        )
+    )
+  return CompliancePolicy(
+      healthy_min_lines=healthy_min,
+      healthy_max_lines=healthy_max,
+      ceiling_max_lines=ceiling_max,
+      min_comment_ratio=min_comment_ratio,
+      file_max_lines_overrides=overrides,
+  )
 
 
 def _docstring_line_numbers(tree: ast.AST) -> set[int]:
@@ -55,16 +137,18 @@ def _docstring_line_numbers(tree: ast.AST) -> set[int]:
 def verify_python_ast_quality(
     file_path: pathlib.Path,
     target_label: str | None = None,
-    max_code_lines: int = 800,
+    max_code_lines: int = 600,
     min_comment_ratio: float = 0.08,
+    healthy_max_lines: int = 400,
 ) -> tuple[CodeQualityViolation, ...]:
   """Audits a single Python file for modularity, docstrings, types, and safety.
 
   Args:
     file_path: Path to the `.py` file to inspect.
     target_label: Optional display path used in reported violations.
-    max_code_lines: Maximum executable lines allowed in non-test modules.
+    max_code_lines: Hard ceiling of executable lines before blocking commits.
     min_comment_ratio: Minimum ratio of `#` comment lines to non-empty lines.
+    healthy_max_lines: Upper bound of healthy range before advisory warning.
 
   Returns:
     Tuple of CodeQualityViolation items (empty when the file is compliant).
@@ -103,7 +187,7 @@ def verify_python_ast_quality(
         )
     )
 
-  # 2. Enforce executable line budget on production modules (excluding comments/docs).
+  # 2. Enforce two-tier executable line range (healthy target + hard ceiling).
   # Counting only executable lines ensures rich docstrings are never penalized.
   if not is_test:
     doc_lines = _docstring_line_numbers(tree)
@@ -112,15 +196,35 @@ def verify_python_ast_quality(
         for idx, ln in enumerate(raw_lines, start=1)
         if ln.strip() and not ln.strip().startswith("#") and idx not in doc_lines
     ]
+    # Clamp healthy threshold to max_code_lines for custom strict callers.
+    effective_healthy_max = min(healthy_max_lines, max_code_lines)
+    # Block only when module size exceeds the upper God-module ceiling.
     if len(exec_lines) > max_code_lines:
       violations.append(
           CodeQualityViolation(
               target=label,
               line_number=1,
               rule_id="AST-MAX-LINES",
+              severity="ERROR",
               message=(
                   f"Module has {len(exec_lines)} executable lines "
-                  f"(budget: {max_code_lines}); split responsibilities."
+                  f"(ceiling: {max_code_lines}, healthy range: <= "
+                  f"{effective_healthy_max}); split responsibilities."
+              ),
+          )
+      )
+    # Emit a non-blocking advisory inside the stretch zone above healthy_max.
+    elif len(exec_lines) > effective_healthy_max:
+      violations.append(
+          CodeQualityViolation(
+              target=label,
+              line_number=1,
+              rule_id="AST-SIZE-ADVISORY",
+              severity="WARNING",
+              message=(
+                  f"Module has {len(exec_lines)} executable lines "
+                  f"(healthy target: <= {effective_healthy_max}, ceiling: "
+                  f"{max_code_lines}); plan a cohesive split when convenient."
               ),
           )
       )

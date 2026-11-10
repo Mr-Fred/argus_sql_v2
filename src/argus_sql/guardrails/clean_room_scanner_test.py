@@ -1,5 +1,7 @@
 """Unit tests for Argus-SQL clean-room IP guardrails, PDF scan, and AST gates."""
 
+import contextlib
+import io
 import pathlib
 import subprocess
 import tempfile
@@ -8,6 +10,8 @@ import zlib
 
 from argus_sql.guardrails.clean_room_scanner import scan_pdf_for_leaks
 from argus_sql.guardrails.clean_room_scanner import scan_text_for_leaks
+from argus_sql.guardrails.cli import main as guardrails_cli_main
+from argus_sql.guardrails.code_quality_verifier import load_compliance_policy
 from argus_sql.guardrails.code_quality_verifier import verify_python_ast_quality
 from argus_sql.guardrails.exceptions import GuardrailError
 from argus_sql.guardrails.hook_installer import bootstrap_clean_git_config
@@ -210,6 +214,147 @@ class CleanRoomScannerTest(unittest.TestCase):
         report.passed,
         msg=f"Leaks={report.leak_findings}, Quality={report.quality_violations}",
     )
+
+  def test_healthy_range_advisory_vs_ceiling_and_policy_overrides(self) -> None:
+    """Stretch modules emit non-blocking WARNING; ceiling violations fail."""
+
+    def _build_module_with_exec_lines(exec_count: int) -> str:
+      """Builds a compliant synthetic module with `exec_count` code lines."""
+      header = (
+          '"""Synthetic module verifying healthy-range AST thresholds."""\n'
+          "# Ensure inline comment density clears >= 8% threshold.\n"
+      )
+      # Add 1 comment per 8 executable lines so AST-COMMENT-RATIO stays clean.
+      body: list[str] = []
+      for idx in range(exec_count):
+        if idx % 8 == 0:
+          body.append(f"# Invariant marker {idx}.")
+        body.append(f"CONST_{idx}: int = {idx}")
+      return header + "\n".join(body) + "\n"
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+      repo = pathlib.Path(tmp_dir)
+      subprocess.run(
+          ["git", "init", str(repo)],
+          capture_output=True,
+          text=True,
+          check=True,
+      )
+      bootstrap_clean_git_config(repo)
+      (repo / ".copilot_compliance.json").write_text(
+          (
+              '{\n'
+              '  "healthy_min_lines": 80,\n'
+              '  "healthy_max_lines": 400,\n'
+              '  "ceiling_max_lines": 600,\n'
+              '  "min_comment_ratio": 0.08,\n'
+              '  "file_max_lines_overrides": {\n'
+              '    "pkg/exempt.py": 650,\n'
+              '    "pkg/strict.py": 250\n'
+              '  }\n'
+              '}\n'
+          ),
+          encoding="utf-8",
+      )
+      policy = load_compliance_policy(repo)
+      self.assertEqual(policy.healthy_max_lines, 400)
+      self.assertEqual(policy.ceiling_max_lines, 600)
+      self.assertEqual(policy.override_for("pkg/exempt.py"), 650)
+      self.assertEqual(policy.override_for("pkg/strict.py"), 250)
+
+      pkg_dir = repo / "pkg"
+      pkg_dir.mkdir()
+      # Exact boundary 400 executable lines: inside healthy range (0 size findings).
+      healthy_mod = pkg_dir / "healthy.py"
+      healthy_mod.write_text(_build_module_with_exec_lines(400), encoding="utf-8")
+      self.assertEqual(verify_python_ast_quality(healthy_mod), ())
+
+      # 450 executable lines: in advisory zone (WARNING only, CLI exits 0).
+      stretch_mod = pkg_dir / "stretch.py"
+      stretch_mod.write_text(_build_module_with_exec_lines(450), encoding="utf-8")
+      stretch_viols = verify_python_ast_quality(stretch_mod)
+      self.assertEqual(len(stretch_viols), 1)
+      self.assertEqual(stretch_viols[0].rule_id, "AST-SIZE-ADVISORY")
+      self.assertEqual(stretch_viols[0].severity, "WARNING")
+      advisory_report = run_repository_audit(repo)
+      self.assertTrue(advisory_report.passed)
+      self.assertEqual(len(advisory_report.advisory_quality_violations), 1)
+
+      # Verify CLI surfaces [WARN] [AST-SIZE-ADVISORY] on stdout and returns 0.
+      out_buf = io.StringIO()
+      err_buf = io.StringIO()
+      with (
+          contextlib.redirect_stdout(out_buf),
+          contextlib.redirect_stderr(err_buf),
+      ):
+        cli_rc = guardrails_cli_main(["--repo-root", str(repo), "--verify-all"])
+      self.assertEqual(cli_rc, 0)
+      self.assertIn("[WARN] [AST-SIZE-ADVISORY]", out_buf.getvalue())
+      self.assertIn("[PASS]", out_buf.getvalue())
+      self.assertEqual(err_buf.getvalue(), "")
+
+      # 620 executable lines with override at 650 passes; without override fails.
+      exempt_mod = pkg_dir / "exempt.py"
+      exempt_mod.write_text(_build_module_with_exec_lines(620), encoding="utf-8")
+      self.assertTrue(run_repository_audit(repo).passed)
+
+      # Stricter per-file override (250) rejects a 280-line module cleanly.
+      strict_mod = pkg_dir / "strict.py"
+      strict_mod.write_text(_build_module_with_exec_lines(280), encoding="utf-8")
+      strict_report = run_repository_audit(repo)
+      self.assertFalse(strict_report.passed)
+      self.assertEqual(
+          [v.target for v in strict_report.blocking_quality_violations],
+          ["pkg/strict.py"],
+      )
+      strict_mod.unlink()
+
+      # Exact global ceiling (600) stays advisory; 601 fails AST-MAX-LINES.
+      bloat_mod = pkg_dir / "bloat.py"
+      bloat_mod.write_text(_build_module_with_exec_lines(601), encoding="utf-8")
+      bloat_viols = verify_python_ast_quality(bloat_mod)
+      self.assertEqual(bloat_viols[0].rule_id, "AST-MAX-LINES")
+      self.assertEqual(bloat_viols[0].severity, "ERROR")
+      failed_report = run_repository_audit(repo)
+      self.assertFalse(failed_report.passed)
+
+  def test_compliance_policy_legacy_and_malformed_fallbacks(self) -> None:
+    """Policy loader handles legacy keys and malformed/bool JSON safely."""
+    with tempfile.TemporaryDirectory() as tmp_dir:
+      repo = pathlib.Path(tmp_dir)
+      # Legacy `default_max_lines` maps into healthy_max_lines cleanly.
+      (repo / ".copilot_compliance.json").write_text(
+          '{"healthy_max_lines": null, "default_max_lines": 320}\n',
+          encoding="utf-8",
+      )
+      legacy_policy = load_compliance_policy(repo)
+      self.assertEqual(legacy_policy.healthy_max_lines, 320)
+      self.assertEqual(legacy_policy.ceiling_max_lines, 600)
+
+      # Malformed types, bools, negative numbers, and bad overrides fall back.
+      (repo / ".copilot_compliance.json").write_text(
+          (
+              '{\n'
+              '  "healthy_min_lines": 999,\n'
+              '  "healthy_max_lines": "bad",\n'
+              '  "ceiling_max_lines": true,\n'
+              '  "min_comment_ratio": 2.5,\n'
+              '  "file_max_lines_overrides": {\n'
+              '    "bad_bool.py": true,\n'
+              '    "bad_neg.py": -5,\n'
+              '    "ok.py": 500\n'
+              '  }\n'
+              '}\n'
+          ),
+          encoding="utf-8",
+      )
+      safe_policy = load_compliance_policy(repo)
+      self.assertEqual(safe_policy.healthy_max_lines, 400)
+      self.assertEqual(safe_policy.healthy_min_lines, 400)
+      self.assertEqual(safe_policy.ceiling_max_lines, 600)
+      self.assertEqual(safe_policy.min_comment_ratio, 0.08)
+      self.assertEqual(safe_policy.file_max_lines_overrides, (("ok.py", 500),))
+
 
 
 if __name__ == "__main__":
