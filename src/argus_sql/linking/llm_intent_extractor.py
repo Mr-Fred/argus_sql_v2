@@ -203,6 +203,7 @@ def parse_intent_json_response(
       complexity=complexity,
       strict_single_column=strict_single,
       has_followup_projection=has_followup,
+      evidence=fallback.evidence,
   )
 
 
@@ -260,6 +261,14 @@ class FlashLiteIntentExtractor:
       _LOGGER.warning(
           "Flash-lite intent extraction failed (%s); falling back to FSM.",
           type(err).__name__,
+      )
+      return (fallbacks, (0,) * len(items))
+
+    if len(resps) != len(fallbacks):
+      _LOGGER.warning(
+          "Flash-lite intent batch size mismatch (%d vs %d); falling back to FSM.",
+          len(resps),
+          len(fallbacks),
       )
       return (fallbacks, (0,) * len(items))
 

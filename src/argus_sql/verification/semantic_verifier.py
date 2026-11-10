@@ -12,6 +12,7 @@ from argus_sql.contracts.types import IntentFrame
 from argus_sql.contracts.types import InvariantIssue
 from argus_sql.contracts.types import LinkedSchemaContext
 from argus_sql.contracts.types import SQLCandidate
+from argus_sql.verification.dialect_invariants import check_abbreviated_surrogate_name
 from argus_sql.verification.dialect_invariants import check_missing_window_rank
 from argus_sql.verification.dialect_invariants import check_projection_arity_drift
 from argus_sql.verification.dialect_invariants import check_timestamp_bare_date_comparison
@@ -301,14 +302,18 @@ def audit_candidate_invariants(
           )
       )
 
-  # 8-12. Audit relational ratios, entity keys, boolean AVG, timestamps & ranks.
+  # 8-13. Audit relational ratios, entity keys, boolean AVG, timestamps, ranks,
+  #       and abbreviated surrogate display names across joins.
   ddl_text = linked_schema.ddl_prompt if linked_schema is not None else ""
   for rel_issue in (
-      check_left_join_filtered_ratio(sql_text, no_strings_sql, no_quotes_sql, ddl_text),
+      check_left_join_filtered_ratio(
+          sql_text, no_strings_sql, no_quotes_sql, ddl_text
+      ),
       check_boolean_avg_for_count(no_quotes_sql, intent),
       check_non_key_entity_grouping(sql_text),
       check_timestamp_bare_date_comparison(sql_text, ddl_text),
       check_missing_window_rank(no_quotes_sql, intent),
+      check_abbreviated_surrogate_name(sql_text, ddl_text, intent),
   ):
     if rel_issue is not None:
       issues.append(rel_issue)

@@ -194,10 +194,18 @@ def _reconstruct_tokens(
   prev_tok: LexToken | None = None
   for tok, text_val in emitted:
     if prev_tok is not None:
-      # Preserve zero-space attachments (e.g., `(K-12)`, `no.`) when original
-      # gap had no whitespace and no skipped filler stood in between.
       gap = source[prev_tok.end : tok.start]
-      if any(ch.isspace() for ch in gap) or gap:
+      # Drop a dangling comma left right before terminal punctuation after a
+      # stripped filler (`what is the rate, um?` -> `what is the rate?`).
+      if gap and tok.kind == "PUNCT" and tok.raw in ".?!" and parts[-1] == ",":
+        parts.pop()
+      is_closing_punct = tok.kind == "PUNCT" and tok.raw in ".?!,;:)]"
+      is_after_open_punct = (
+          prev_tok.kind == "PUNCT" and prev_tok.raw in "([{"
+      )
+      # Preserve zero-space attachments around punctuation/brackets even when
+      # fillers were skipped in between (`rate uh?` -> `rate?`).
+      if gap and not is_closing_punct and not is_after_open_punct:
         parts.append(" ")
     parts.append(text_val)
     prev_tok = tok

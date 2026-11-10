@@ -228,9 +228,11 @@ def _scan_tokens_fsm(
       phrase = " ".join(words)
       if phrase and phrase.lower() not in ENTITY_STOPWORDS:
         _add_span(phrase)
-      # Preserve single-pass prepositional lookahead if a prep trigger led run.
-      idx = run_end
-      continue
+      # If the proper-noun scan consumed only a single capitalized stopword
+      # (e.g., `In fresno schools`), fall through so prep lookahead still runs.
+      if words or run_end > idx + 1:
+        idx = run_end
+        continue
 
     if scan_question_cues and tok.kind == "WORD":
       # 4a. Hyphen-prefixed status codes (`czk-paying` -> `czk`).
@@ -415,4 +417,5 @@ def canonicalize_intent(question: str, evidence: str = "") -> IntentFrame:
       complexity=complexity,
       strict_single_column=strict_single,
       has_followup_projection=has_followup,
+      evidence=evidence,
   )

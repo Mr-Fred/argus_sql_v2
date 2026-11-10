@@ -1,6 +1,6 @@
 """Deterministic zero-token SQLite dialect repair and LLM repair prompt builder.
 
-Repairs common high-frequency BIRD-SQL failure patterns—integer division
+Repairs common high-frequency SQLite failure patterns—integer division
 truncation, unfiltered NULLs in ascending `ORDER BY ... LIMIT`, and ungrounded
 string literal abbreviations—in sub-millisecond time without extra API calls.
 """

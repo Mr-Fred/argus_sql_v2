@@ -662,6 +662,61 @@ class LinkingModuleTest(unittest.TestCase):
     ).extract_intent(q)
     self.assertEqual(f_bad, expected_fsm)
 
+    # 3. Mismatched batch response length falls back cleanly to FSM.
+    class _ShortBatchLLM:
+      """Mock BatchLLMPort returning fewer responses than requested."""
+
+      def batch_complete(
+          self, requests: tuple[LLMCompletionRequest, ...]
+      ) -> tuple[LLMCompletionResponse, ...]:
+        """Returns an empty tuple to simulate batch alignment mismatch.
+
+        Args:
+          requests: Batch of completion requests.
+
+        Returns:
+          Empty tuple of responses.
+        """
+        del requests
+        return ()
+
+    f_mismatch, t_mismatch = FlashLiteIntentExtractor(
+        llm=_ShortBatchLLM()
+    ).extract_intent_batch_with_usage(((q, ""),))
+    self.assertEqual(f_mismatch, (expected_fsm,))
+    self.assertEqual(t_mismatch, (0,))
+
+  def test_fsm_punctuation_attachment_and_capitalized_preposition_lookahead(
+      self,
+  ) -> None:
+    """Stripped trailing fillers keep punctuation flush; leading preps trigger spans."""
+    from argus_sql.linking.asr_normalizer import clean_asr_utterance
+    from argus_sql.linking.intent_canonicalizer import extract_raw_entities
+
+    # Trailing fillers before `?` or inside `(...)` leave zero stray spaces.
+    cleaned_q, cnt_q = clean_asr_utterance("what is the rate uh?")
+    self.assertEqual(cleaned_q, "What is the rate?")
+    self.assertEqual(cnt_q, 1)
+
+    cleaned_comma, cnt_comma = clean_asr_utterance("what is the rate, um?")
+    self.assertEqual(cleaned_comma, "What is the rate?")
+    self.assertEqual(cnt_comma, 1)
+
+    cleaned_paren, _ = clean_asr_utterance(
+        "show me the top five schools in (uh, K-12)?"
+    )
+    self.assertEqual(cleaned_paren, "The top 5 schools in (K-12)?")
+
+    # Sentence-initial capitalized prepositions still trigger n-gram lookahead.
+    self.assertEqual(
+        extract_raw_entities("In fresno schools, what is the average score?"),
+        ("fresno schools",),
+    )
+    self.assertEqual(
+        extract_raw_entities("For active accounts, list the balance."),
+        ("active accounts",),
+    )
+
 
 if __name__ == "__main__":
   unittest.main()

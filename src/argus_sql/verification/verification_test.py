@@ -930,6 +930,176 @@ class VerificationAndArbiterTest(unittest.TestCase):
     )
     self.assertEqual(non_err_win.candidate.strategy, "s_warn")
 
+  def test_abbreviated_surrogate_name_and_nullable_left_join_preservation(
+      self,
+  ) -> None:
+    """Verifies schema-driven surrogate-name checks and safe LEFT JOIN ratios."""
+    out_pct = ExecutionOutcome(
+        True, ((12.5,),), ("pct",), 1, 1.0, "", compute_result_signature(((12.5,),))
+    )
+
+    # 1. Valid nullable-FK LEFT JOIN CASE/IIF ratios must NOT be rewritten to
+    #    INNER JOIN (preserving unmatched parent rows in the denominator).
+    enterprise_ddl = (
+        "CREATE TABLE orders (\n  order_id INTEGER PRIMARY KEY,\n"
+        "  customer_id INTEGER,\n  total REAL\n);\n\n"
+        "CREATE TABLE customers (\n  customer_id INTEGER PRIMARY KEY,\n"
+        "  tier TEXT\n);"
+    )
+    linked_orders = LinkedSchemaContext(
+        "enterprise_sales", ("orders", "customers"), (), (), (), (), enterprise_ddl
+    )
+    intent_orders = canonicalize_intent(
+        "What percentage of high-value orders were placed by VIP customers?"
+    )
+    cand_left_case = SQLCandidate(
+        "SELECT 100.0 * COUNT(CASE WHEN T2.tier = 'VIP' THEN 1 END) "
+        "/ COUNT(T1.order_id) "
+        "FROM orders AS T1 LEFT JOIN customers AS T2 "
+        "ON T1.customer_id = T2.customer_id WHERE T1.total > 500",
+        "decomposed_cot",
+    )
+    self.assertEqual(
+        audit_candidate_invariants(
+            cand_left_case, out_pct, intent_orders, linked_orders
+        ),
+        (),
+    )
+
+    # 2. Schema-driven ABBREVIATED_SURROGATE_NAME works across arbitrary
+    #    enterprise schemas without hardcoded domain or column vocabularies.
+    hr_ddl = (
+        "CREATE TABLE emp_summary (\n  emp_id INTEGER PRIMARY KEY,\n"
+        "  dname TEXT,\n  salary INTEGER\n);\n\n"
+        'CREATE TABLE departments (\n  dept_id INTEGER PRIMARY KEY,\n'
+        '  "Department Name" TEXT\n);'
+    )
+    linked_hr = LinkedSchemaContext(
+        "enterprise_hr", ("emp_summary", "departments"), (), (), (), (), hr_ddl
+    )
+    intent_dept = canonicalize_intent(
+        "Give the names of the active departments with high salary."
+    )
+    c_dept_abbr = SQLCandidate(
+        "SELECT T1.dname FROM emp_summary AS T1 INNER JOIN departments AS T2 "
+        "ON T1.emp_id = T2.dept_id WHERE T1.salary > 100000",
+        "skeleton_minimal",
+    )
+    c_dept_full = SQLCandidate(
+        'SELECT T2."Department Name" FROM emp_summary AS T1 '
+        "INNER JOIN departments AS T2 ON T1.emp_id = T2.dept_id "
+        "WHERE T1.salary > 100000",
+        "decomposed_cot",
+    )
+    sig_abbr = compute_result_signature((("Eng",),))
+    sig_canon = compute_result_signature((("Engineering",),))
+    out_abbr = ExecutionOutcome(
+        True, (("Eng",),), ("dname",), 1, 0.2, "", sig_abbr
+    )
+    out_canon = ExecutionOutcome(
+        True, (("Engineering",),), ("Department Name",), 1, 2.0, "", sig_canon
+    )
+    iss_hr = audit_candidate_invariants(c_dept_abbr, out_abbr, intent_dept, linked_hr)
+    self.assertEqual([i.code for i in iss_hr], ["ABBREVIATED_SURROGATE_NAME"])
+    self.assertEqual(iss_hr[0].severity, "WARNING")
+    self.assertEqual(
+        audit_candidate_invariants(c_dept_full, out_canon, intent_dept, linked_hr),
+        (),
+    )
+    # 1 clean `"Department Name"` (1.00) outscores 2 `dname` WARNINGs (0.96).
+    win_hr, _, _ = verify_and_rank_candidates(
+        (c_dept_abbr, c_dept_abbr, c_dept_full),
+        (out_abbr, out_abbr, out_canon),
+        intent_dept,
+        linked_schema=linked_hr,
+    )
+    self.assertEqual(win_hr.outcome.result_signature, sig_canon)
+
+    # 3. DDL-description-driven abbreviation matching (e.g., `v_code` with
+    #    `-- vendor name`) resolves to joined `vendors."Vendor Name"`.
+    vendor_ddl = (
+        "CREATE TABLE shipments (\n  id INTEGER PRIMARY KEY,\n"
+        "  v_code TEXT -- vendor name | examples: ['ACME']\n);\n\n"
+        'CREATE TABLE vendors (\n  id INTEGER PRIMARY KEY,\n'
+        '  "Vendor Name" TEXT\n);'
+    )
+    linked_vendor = LinkedSchemaContext(
+        "supply_chain", ("shipments", "vendors"), (), (), (), (), vendor_ddl
+    )
+    intent_vendor = canonicalize_intent("List the vendor names for shipments.")
+    c_vendor_abbr = SQLCandidate(
+        "SELECT T1.v_code FROM shipments AS T1 INNER JOIN vendors AS T2 "
+        "ON T1.id = T2.id",
+        "cot",
+    )
+    from argus_sql.verification.dialect_invariants import find_abbreviated_surrogate_rewrites
+
+    rws_vendor = find_abbreviated_surrogate_rewrites(
+        c_vendor_abbr.sql, linked_vendor.ddl_prompt, intent_vendor
+    )
+    self.assertEqual(len(rws_vendor), 1)
+    self.assertEqual(rws_vendor[0][2:], ("T1.v_code", 'T2."Vendor Name"'))
+
+    # 4. Also verifies `sname` -> `"School Name"` via generic prefix rules,
+    #    while skipping `surname`, `AS sname` aliases, `GROUP BY`, `COUNT`, and
+    #    non-name queries.
+    schools_ddl = (
+        'CREATE TABLE satscores (\n  cds TEXT PRIMARY KEY,\n  sname TEXT,\n'
+        '  surname TEXT,\n  NumGE1500 INTEGER\n);\n\n'
+        'CREATE TABLE frpm (\n  CDSCode TEXT PRIMARY KEY,\n'
+        '  "School Name" TEXT,\n  "Percent (%) Eligible Free (K-12)" REAL\n);'
+    )
+    linked_schools = LinkedSchemaContext(
+        "california_schools", ("satscores", "frpm"), (), (), (), (), schools_ddl
+    )
+    intent_school = canonicalize_intent(
+        "Give the names of the schools with score >= 1500?"
+    )
+    c_sname_alias = SQLCandidate(
+        'SELECT T1.sname AS sname FROM satscores AS T1 INNER JOIN frpm AS T2 '
+        'ON T1.cds = T2.CDSCode',
+        "formula_defensive",
+    )
+    rws_school = find_abbreviated_surrogate_rewrites(
+        c_sname_alias.sql, linked_schools.ddl_prompt, intent_school
+    )
+    self.assertEqual(len(rws_school), 1)
+    self.assertEqual(rws_school[0][2:], ("T1.sname", 'T2."School Name"'))
+
+    c_surname = SQLCandidate(
+        "SELECT T1.surname FROM satscores AS T1 INNER JOIN frpm AS T2 "
+        "ON T1.cds = T2.CDSCode",
+        "cot",
+    )
+    self.assertEqual(
+        audit_candidate_invariants(c_surname, out_abbr, intent_school, linked_schools),
+        (),
+    )
+    intent_no_name = canonicalize_intent("What are the CDS codes of the schools?")
+    self.assertEqual(
+        audit_candidate_invariants(c_sname_alias, out_abbr, intent_no_name, linked_schools),
+        (),
+    )
+    c_gb_sname = SQLCandidate(
+        "SELECT T1.sname FROM satscores AS T1 INNER JOIN frpm AS T2 "
+        "ON T1.cds = T2.CDSCode GROUP BY T1.sname",
+        "cot",
+    )
+    self.assertEqual(
+        audit_candidate_invariants(c_gb_sname, out_abbr, intent_school, linked_schools),
+        (),
+    )
+    c_fn_sname = SQLCandidate(
+        "SELECT COUNT(T1.sname) FROM satscores AS T1 INNER JOIN frpm AS T2 "
+        "ON T1.cds = T2.CDSCode",
+        "cot",
+    )
+    self.assertEqual(
+        audit_candidate_invariants(c_fn_sname, out_abbr, intent_school, linked_schools),
+        (),
+    )
+
+
 
 if __name__ == "__main__":
   unittest.main()

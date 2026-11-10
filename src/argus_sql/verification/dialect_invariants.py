@@ -1,6 +1,6 @@
-"""SQLite temporal, window-rank, and projection arity dialect invariants.
+"""SQLite temporal, window-rank, projection arity, and surrogate-name invariants.
 
-Implements three domain-general SQLite invariants with zero runtime I/O:
+Implements four domain-general SQLite invariants with zero runtime I/O:
 1. `TIMESTAMP_BARE_DATE_COMPARISON` (I11): Detects bare `'YYYY-MM-DD'` literal
    comparisons (`=`, `!=`, `<>`, `>`, `<=`, `BETWEEN`) against sub-day ISO
    timestamp columns (`range: 'YYYY-MM-DD HH:MM...'`) where ASCII string
@@ -11,6 +11,10 @@ Implements three domain-general SQLite invariants with zero runtime I/O:
 3. `PROJECTION_ARITY_DRIFT`: Audits outer wildcard (`SELECT *` / `table.*`)
    over-projections (escalated to `ERROR` when `expected_projection_arity <= 2`),
    strict single-column drift, and 1-column follow-up under-projections.
+4. `ABBREVIATED_SURROGATE_NAME`: Flags abbreviated surrogate display columns
+   (e.g., `<prefix>name` / `<prefix>_nm` or DDL-annotated short codes) across
+   multi-table joins when a joined table provides the canonical full `<Entity>
+   Name` column requested by the user question.
 """
 
 import re
@@ -445,3 +449,328 @@ def check_projection_arity_drift(
       ),
       repair_hint=arity_hint,
   )
+
+
+# Function/modifier words excluded when extracting entity nouns near "name(s)".
+_NON_ENTITY_NAME_MODIFIERS: frozenset[str] = frozenset({
+    "full", "first", "last", "middle", "user", "nick", "real", "actual",
+    "exact", "short", "display", "given", "family", "sur", "table", "column",
+    "field", "file", "the", "their", "his", "her", "its", "whose", "which",
+    "what", "that", "this", "these", "those", "with", "and", "or", "all",
+    "both", "each", "any", "same", "different", "other", "new", "old",
+})
+
+# Matches "name(s) of [the] <up-to-3-words>" or "<entity> name(s)".
+_NAME_OF_ENTITY_RE = re.compile(
+    r"\bnames?\s+of\s+(?:the\s+)?([a-z0-9-]+(?:\s+[a-z0-9-]+){0,2})",
+    re.IGNORECASE,
+)
+_ENTITY_NAME_PHRASE_RE = re.compile(
+    r"\b([a-z]{3,24})\s+names?\b",
+    re.IGNORECASE,
+)
+
+# String column type prefixes eligible as canonical full-name targets.
+_TEXT_TYPE_PREFIXES: tuple[str, ...] = (
+    "TEXT", "VARCHAR", "CHAR", "NVARCHAR", "NCHAR", "CLOB",
+)
+
+
+def _singularize_entity_noun(word: str) -> str:
+  """Normalizes plural English entity nouns to singular lowercase stems."""
+  low = word.lower()
+  if len(low) > 4 and low.endswith("ies"):
+    return low[:-3] + "y"
+  if len(low) > 4 and low.endswith(("ches", "shes", "sses", "xes", "zes", "oes")):
+    return low[:-2]
+  if len(low) > 3 and low.endswith("s") and not low.endswith(("ss", "us", "is")):
+    return low[:-1]
+  return low
+
+
+def _split_ident_words(name: str) -> tuple[str, ...]:
+  """Splits camelCase, snake_case, and space-delimited identifiers to words."""
+  spaced = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", name)
+  spaced = re.sub(r"([A-Z]+)([A-Z][a-z])", r"\1 \2", spaced)
+  return tuple(w.lower() for w in re.findall(r"[a-zA-Z0-9]+", spaced))
+
+
+def _extract_requested_name_entities(question_text: str) -> tuple[str, ...]:
+  """Extracts singularized entity nouns explicitly requested by name."""
+  entities: list[str] = []
+  seen: set[str] = set()
+  for pattern in (_NAME_OF_ENTITY_RE, _ENTITY_NAME_PHRASE_RE):
+    for match in pattern.finditer(question_text):
+      for raw_tok in re.findall(r"[a-z]{3,24}", match.group(1).lower()):
+        if raw_tok in _NON_ENTITY_NAME_MODIFIERS:
+          continue
+        stem = _singularize_entity_noun(raw_tok)
+        if stem not in _NON_ENTITY_NAME_MODIFIERS and stem not in seen:
+          seen.add(stem)
+          entities.append(stem)
+  return tuple(entities)
+
+
+def _extract_ddl_table_columns(
+    ddl_prompt: str,
+) -> dict[str, dict[str, tuple[str, str, str]]]:
+  """Maps `lower_table -> {lower_col: (raw_col, upper_type, description)}`."""
+  table_cols: dict[str, dict[str, tuple[str, str, str]]] = {}
+  for match in _DDL_BLOCK_RE.finditer(ddl_prompt):
+    t_name = (
+        match.group(1).replace('""', '"') if match.group(1) else match.group(2)
+    ).lower()
+    cols = table_cols.setdefault(t_name, {})
+    for raw_line in match.group(3).splitlines():
+      # Split DDL column declaration from optional `-- description | ...` note.
+      code_part, _, comment_part = raw_line.partition("--")
+      code_clean = code_part.strip()
+      col_m = _DDL_COL_HEAD_RE.match(code_clean)
+      if col_m is None:
+        continue
+      c_name = (
+          col_m.group(1).replace('""', '"') if col_m.group(1) else col_m.group(2)
+      )
+      rest = code_clean[col_m.end() :].strip().rstrip(",")
+      type_tok = rest.split(None, 1)[0].upper() if rest else ""
+      # Keep leading prose description ahead of `| range:` / `| examples:`.
+      desc = comment_part.split("|", 1)[0].strip().lower()
+      cols[c_name.lower()] = (c_name, type_tok, desc)
+  return table_cols
+
+
+def _extract_outer_join_bindings(
+    outer_sql: str,
+) -> tuple[dict[str, str], dict[str, str]]:
+  """Extracts `(alias_low -> tbl_low, tbl_low -> preferred_qualifier)`."""
+  alias_map: dict[str, str] = {}
+  preferred_qual: dict[str, str] = {}
+  for m in _TABLE_ALIAS_RE.finditer(outer_sql):
+    raw_tbl = m.group(1) or m.group(2) or m.group(3) or m.group(4) or ""
+    tbl_clean = raw_tbl.replace('""', '"').replace("``", "`")
+    tbl_low = tbl_clean.lower()
+    if not tbl_low:
+      continue
+    # Register table name and prefer explicit SQL alias (`T2`) as qualifier.
+    alias_map.setdefault(tbl_low, tbl_low)
+    raw_alias = m.group(5) or m.group(6) or m.group(7) or m.group(8) or ""
+    alias_clean = raw_alias.replace('""', '"').replace("``", "`")
+    alias_low = alias_clean.lower()
+    if alias_low:
+      alias_map[alias_low] = tbl_low
+      preferred_qual.setdefault(tbl_low, alias_clean)
+    else:
+      preferred_qual.setdefault(tbl_low, tbl_clean)
+  return (alias_map, preferred_qual)
+
+
+def _is_abbreviated_surrogate_for_entity(
+    abbr_low: str,
+    col_desc: str,
+    entity: str,
+) -> bool:
+  """Returns True when `abbr_low` is a shortened `<prefix>name` or DDL-noted abbr."""
+  # Never treat canonical `name` itself as an abbreviated surrogate.
+  if abbr_low == "name" or len(abbr_low) > 12:
+    return False
+  # If DDL prose explicitly documents a different name (e.g. `surname`), skip.
+  desc_words = set(re.findall(r"[a-z]+", col_desc))
+  if "surname" in desc_words and entity not in desc_words:
+    return False
+
+  # Match structural prefix abbreviations (`sname` / `dept_name` / `cust_nm`).
+  for suffix in ("_name", "name", "_nm", "nm"):
+    if abbr_low.endswith(suffix):
+      pfx = abbr_low[: -len(suffix)].rstrip("_")
+      if 1 <= len(pfx) < len(entity) and entity.startswith(pfx):
+        return True
+
+  # Match compact columns whose DDL description explicitly pairs `<entity> name`.
+  return len(abbr_low) <= 8 and entity in desc_words and "name" in desc_words
+
+
+def _find_canonical_name_column(
+    entity: str,
+    abbr_len: int,
+    abbr_tables: set[str],
+    preferred_qual: dict[str, str],
+    table_cols: dict[str, dict[str, tuple[str, str, str]]],
+) -> tuple[str, str] | None:
+  """Finds a strictly fuller canonical `<Entity> Name` column on another joined table."""
+  # Tier 1: `<Entity> Name` (`"School Name"`, `department_name`, `CustomerName`).
+  # Tier 2: Bare `<Entity>` TEXT column (`School TEXT`) when Tier 1 is absent.
+  tier2_match: tuple[str, str] | None = None
+  for tbl in preferred_qual:
+    if tbl in abbr_tables:
+      continue
+    for raw_col, col_type, _ in table_cols.get(tbl, {}).values():
+      if len(raw_col) <= abbr_len:
+        continue
+      is_text_like = (not col_type) or col_type.startswith(_TEXT_TYPE_PREFIXES)
+      if not is_text_like:
+        continue
+      words = _split_ident_words(raw_col)
+      if words == (entity, "name"):
+        return (tbl, raw_col)
+      if (
+          tier2_match is None
+          and col_type.startswith(_TEXT_TYPE_PREFIXES)
+          and words == (entity,)
+      ):
+        tier2_match = (tbl, raw_col)
+  return tier2_match
+
+
+def find_abbreviated_surrogate_rewrites(
+    sql_text: str,
+    ddl_prompt: str,
+    intent: IntentFrame | None,
+) -> list[tuple[int, int, str, str]]:
+  """Locates abbreviated surrogate projections in outer SELECT across joins.
+
+  Args:
+    sql_text: Candidate SQL query string.
+    ddl_prompt: Rendered `CREATE TABLE` DDL string for joined tables.
+    intent: Optional IntentFrame supplying natural-language entity-name cues.
+
+  Returns:
+    List of `(start_idx, end_idx, old_expr, canonical_expr)` replacement tuples.
+  """
+  # Require schema DDL confirmation, intent cues, and a top-level JOIN.
+  if not ddl_prompt or intent is None:
+    return []
+  outer_sql = mask_outer_sql(sql_text)
+  if re.search(r"\bJOIN\b", outer_sql, re.IGNORECASE) is None:
+    return []
+
+  # Extract entity nouns requested by name from the user question dynamically.
+  q_text = f"{intent.canonical_question} {intent.raw_question}"
+  requested_entities = _extract_requested_name_entities(q_text)
+  if not requested_entities:
+    return []
+
+  # Isolate the final outer `SELECT ... FROM` projection span (after any CTE).
+  sel_matches = list(
+      re.finditer(
+          r"\bSELECT\s+(?:DISTINCT\s+|ALL\s+)?([\s\S]+?)(?=\bFROM\b)",
+          outer_sql,
+          re.IGNORECASE,
+      )
+  )
+  if not sel_matches:
+    return []
+  sel_match = sel_matches[-1]
+  sel_start, sel_end = sel_match.start(1), sel_match.end(1)
+  sel_slice = sql_text[sel_start:sel_end]
+  # Mask single-quoted literals with equal spaces so character offsets align.
+  sel_masked = re.sub(
+      r"'(?:''|[^'])*'", lambda m: " " * len(m.group(0)), sel_slice
+  )
+
+  # Collect outer-scope table aliases and canonical column maps from DDL.
+  table_cols = _extract_ddl_table_columns(ddl_prompt)
+  alias_map, preferred_qual = _extract_outer_join_bindings(outer_sql)
+  if len(preferred_qual) < 2:
+    return []
+
+  rewrites: list[tuple[int, int, str, str]] = []
+  seen_spans: set[tuple[int, int]] = set()
+  for entity in requested_entities:
+    # Identify abbreviated surrogate columns matching `entity` on joined tables.
+    abbr_candidates: dict[str, set[str]] = {}
+    for tbl in preferred_qual:
+      for c_low, (_, _, desc) in table_cols.get(tbl, {}).items():
+        if _is_abbreviated_surrogate_for_entity(c_low, desc, entity):
+          abbr_candidates.setdefault(c_low, set()).add(tbl)
+
+    for abbr_low, abbr_tables in abbr_candidates.items():
+      canon_hit = _find_canonical_name_column(
+          entity, len(abbr_low), abbr_tables, preferred_qual, table_cols
+      )
+      if canon_hit is None:
+        continue
+      target_tbl, exact_canon = canon_hit
+
+      # Skip if the canonical column is already projected in the outer SELECT.
+      if re.search(rf"\b{re.escape(exact_canon)}\b", sel_masked, re.IGNORECASE):
+        continue
+
+      # Avoid desyncing SELECT and GROUP BY when grouping by the surrogate col.
+      if re.search(
+          rf"\bGROUP\s+BY\b[\s\S]*\b{re.escape(abbr_low)}\b",
+          outer_sql,
+          re.IGNORECASE,
+      ):
+        continue
+
+      # Format canonical column reference with SQL double quotes when needed.
+      qual = preferred_qual[target_tbl]
+      col_ident = (
+          exact_canon
+          if re.fullmatch(r"[a-zA-Z_][a-zA-Z0-9_]*", exact_canon)
+          else f'"{exact_canon}"'
+      )
+      canon_expr = f"{qual}.{col_ident}"
+
+      # Scan outer SELECT projection items for the abbreviated column token.
+      abbr_esc = re.escape(abbr_low)
+      abbr_pat = re.compile(
+          rf"(?:([a-zA-Z_][a-zA-Z0-9_]*)\s*\.\s*)?"
+          rf'(?:"({abbr_esc})"|`({abbr_esc})`|\[({abbr_esc})\]|\b({abbr_esc})\b)',
+          re.IGNORECASE,
+      )
+      for m in abbr_pat.finditer(sel_masked):
+        # Never flag output aliases (`AS abbr`) or function arguments (`COUNT(abbr)`).
+        prefix_slice = sel_masked[: m.start()]
+        if re.search(r"\bAS\s+$", prefix_slice, re.IGNORECASE):
+          continue
+        if prefix_slice.count("(") > prefix_slice.count(")"):
+          continue
+        src_qual = m.group(1)
+        if src_qual is not None:
+          src_tbl = alias_map.get(src_qual.lower())
+          if src_tbl not in abbr_tables:
+            continue
+        span = (sel_start + m.start(), sel_start + m.end())
+        if span not in seen_spans:
+          seen_spans.add(span)
+          old_expr = sel_slice[m.start() : m.end()]
+          rewrites.append((span[0], span[1], old_expr, canon_expr))
+  return rewrites
+
+
+def check_abbreviated_surrogate_name(
+    sql_text: str,
+    ddl_prompt: str,
+    intent: IntentFrame | None,
+) -> InvariantIssue | None:
+  """Flags abbreviated surrogate name projections across multi-table joins.
+
+  Args:
+    sql_text: Candidate SQL query string.
+    ddl_prompt: Rendered `CREATE TABLE` DDL string for joined tables.
+    intent: Optional IntentFrame supplying natural-language entity-name cues.
+
+  Returns:
+    WARNING-level InvariantIssue when a canonical full-name column is available
+    on a joined table, else None.
+  """
+  # Emit WARNING so clean canonical full-name projections outscore abbreviated
+  # surrogate projections in consensus weighting without failing execution.
+  rewrites = find_abbreviated_surrogate_rewrites(sql_text, ddl_prompt, intent)
+  if not rewrites:
+    return None
+  _, _, old_expr, canon_expr = rewrites[0]
+  return InvariantIssue(
+      code="ABBREVIATED_SURROGATE_NAME",
+      severity="WARNING",
+      message=(
+          f"Projecting abbreviated surrogate column `{old_expr}` across a "
+          f"join containing canonical `{canon_expr}` loses full display names."
+      ),
+      repair_hint=(
+          f"Replace abbreviated `{old_expr}` with canonical `{canon_expr}` "
+          "in the outer SELECT clause."
+      ),
+  )
+

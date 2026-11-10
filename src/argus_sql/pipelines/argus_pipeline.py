@@ -122,13 +122,8 @@ class ArgusSQLPipeline:
   def _build_intent_with_tokens(self, task: NLQueryTask) -> tuple[IntentFrame, int]:
     """Canonicalizes intent via optional flash-lite port or deterministic FSM."""
     if self._config.enable_voice_canonicalizer:
-      extractor = (
-          self._intent_llm
-          if (self._intent_llm is not None or self._config.enable_llm_intent_extractor)
-          else None
-      )
       return canonicalize_intent_with_optional_llm(
-          task.question, task.evidence, extractor=extractor
+          task.question, task.evidence, extractor=self._intent_llm
       )
     return (
         IntentFrame(
@@ -140,6 +135,7 @@ class ArgusSQLPipeline:
             requires_extrema_order=False,
             expected_projection_arity=1,
             complexity=QueryDifficulty.MODERATE,
+            evidence=task.evidence,
         ),
         0,
     )
