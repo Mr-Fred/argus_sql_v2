@@ -24,6 +24,7 @@ class ArgusAblationConfig:
     enable_semantic_verifier: Audit SQLite dialect & semantic invariants.
     enable_algebraic_repair: Apply zero-token algebraic dialect rewrites.
     max_llm_repair_rounds: Maximum LLM diagnostic repair rounds on hard errors.
+    enable_llm_intent_extractor: Use optional flash-lite LLM Stage 1 pass.
   """
 
   # Default flags enable the full 4-stage Argus-SQL sweet-spot configuration.
@@ -36,6 +37,7 @@ class ArgusAblationConfig:
   enable_semantic_verifier: bool = True
   enable_algebraic_repair: bool = True
   max_llm_repair_rounds: int = 1
+  enable_llm_intent_extractor: bool = False
 
 
 # Shared structural interface implemented by B0, B1, B2, B3, and Argus-SQL.

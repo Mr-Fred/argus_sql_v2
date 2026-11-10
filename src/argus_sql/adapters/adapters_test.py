@@ -336,6 +336,30 @@ class AdaptersModuleTest(unittest.TestCase):
         (("order_id", "INTEGER", ()), ("Academic Year", "TEXT", ("2014-2015",))),
     )
 
+  def test_build_intent_llm_client_offline_fallback_and_flash_lite_slug(
+      self,
+  ) -> None:
+    """`build_intent_llm_client` falls back to None offline and defaults flash-lite."""
+    from argus_sql.adapters.client_factory import build_intent_llm_client
+
+    # Without credentials in env or `.env`, returns None cleanly when allowed.
+    with tempfile.TemporaryDirectory() as tmp_dir:
+      empty_env = Path(tmp_dir) / ".env"
+      empty_env.write_text("", encoding="utf-8")
+      with mock.patch.dict("os.environ", {}, clear=True):
+        self.assertIsNone(
+            build_intent_llm_client(dotenv_path=empty_env, fallback_to_none=True)
+        )
+        # With Vertex project configured, auto-selects gemini-2.5-flash-lite.
+        with mock.patch.dict(
+            "os.environ", {"GOOGLE_CLOUD_PROJECT": "demo-eval-project-01"}, clear=True
+        ):
+          intent_client = build_intent_llm_client(
+              dotenv_path=empty_env, fallback_to_none=False
+          )
+          self.assertIsInstance(intent_client, VertexGeminiBatchClient)
+          self.assertEqual(intent_client.model_name, "gemini-2.5-flash-lite")
+
 
 if __name__ == "__main__":
   unittest.main()

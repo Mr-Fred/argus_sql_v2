@@ -1034,6 +1034,89 @@ class ComparativePipelinesTest(unittest.TestCase):
       self.assertEqual(final_out.rows, (("Leclerc",),))
       self.assertNotIn("IS NOT NULL", pred.final_sql)
 
+  def test_argus_pipeline_uses_optional_intent_llm_and_falls_back_cleanly(
+      self,
+  ) -> None:
+    """`ArgusSQLPipeline` integrates flash-lite intent tokens and hermetic fallback."""
+    from argus_sql.adapters.types import LLMCompletionRequest
+    from argus_sql.adapters.types import LLMCompletionResponse
+
+    class _IntentJsonMockLLM:
+      """Mock `BatchLLMPort` returning structured JSON for Stage 1."""
+
+      def batch_complete(
+          self, requests: tuple[LLMCompletionRequest, ...]
+      ) -> tuple[LLMCompletionResponse, ...]:
+        """Returns deterministic JSON intent completions for `requests`.
+
+        Args:
+          requests: Batch of intent extraction requests.
+
+        Returns:
+          Tuple of mock `LLMCompletionResponse` items.
+        """
+        payload = (
+            '{"canonical_question": "How many schools are in California?", '
+            '"entities": ["California"], "expected_projection_arity": 1, '
+            '"requires_floating_division": false, '
+            '"requires_extrema_order": false, "complexity": "simple"}'
+        )
+        return tuple(
+            LLMCompletionResponse(req.request_id, "", payload, 30, 20)
+            for req in requests
+        )
+
+    with tempfile.TemporaryDirectory() as tmp:
+      root = pathlib.Path(tmp)
+      db_file = root / "schools.sqlite"
+      conn = sqlite3.connect(db_file)
+      try:
+        conn.execute(
+            "CREATE TABLE schools (id INTEGER PRIMARY KEY, state TEXT)"
+        )
+        conn.executemany(
+            "INSERT INTO schools VALUES (?, ?)",
+            [(1, "California"), (2, "California"), (3, "New York")],
+        )
+        conn.commit()
+      finally:
+        conn.close()
+
+      schema = DatabaseSchema(
+          db_id="schools",
+          tables=(
+              TableSchema(
+                  "schools",
+                  (
+                      ColumnSchema("id", "INTEGER", is_primary_key=True),
+                      ColumnSchema(
+                          "state", "TEXT", value_examples=("California", "New York")
+                      ),
+                  ),
+              ),
+          ),
+      )
+      sandbox = SQLiteReadOnlySandbox(SandboxPolicy(allowed_db_root=root))
+      synth = SchemaGuidedDiagnosticSynthesizer()
+      task = NLQueryTask(
+          question_id="intent_opt_1",
+          db_id="schools",
+          question="uh how many schools are in calif",
+          difficulty=QueryDifficulty.SIMPLE,
+      )
+
+      # 1. With valid flash-lite JSON intent extractor, accounts 50 intent tokens.
+      pipe_lite = ArgusSQLPipeline(synth, sandbox, intent_llm=_IntentJsonMockLLM())
+      pred_lite = pipe_lite.predict(task, schema, db_file)
+      self.assertEqual(dict(pred_lite.metadata)["intent_tokens"], "50")
+      self.assertEqual(sandbox.execute(db_file, pred_lite.final_sql).rows, ((2,),))
+
+      # 2. Hermetic fallback: passing SQL synthesizer as intent_llm emits 0/non-JSON
+      #    and falls back automatically to deterministic FSM canonicalization.
+      pipe_fallback = ArgusSQLPipeline(synth, sandbox, intent_llm=synth)
+      pred_fb = pipe_fallback.predict(task, schema, db_file)
+      self.assertEqual(sandbox.execute(db_file, pred_fb.final_sql).rows, ((2,),))
+
 
 if __name__ == "__main__":
   unittest.main()

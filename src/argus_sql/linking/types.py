@@ -1,6 +1,29 @@
 """Configuration and scoring contracts for hybrid schema and value linking."""
 
+from collections.abc import Sequence
 import dataclasses
+from typing import Protocol
+
+from argus_sql.contracts.types import IntentFrame
+
+
+# Lightweight Stage 1 port for optional structured LLM intent extraction.
+class IntentExtractorPort(Protocol):
+  """Port interface for batched Stage 1 intent extraction with deterministic fallback."""
+
+  def extract_intent_batch(
+      self,
+      items: Sequence[tuple[str, str]],
+  ) -> tuple[IntentFrame, ...]:
+    """Extracts structured IntentFrame contracts for `(question, evidence)` pairs.
+
+    Args:
+      items: Sequence of `(question, evidence)` input pairs.
+
+    Returns:
+      Tuple of IntentFrame contracts aligned 1-to-1 with `items`.
+    """
+    ...
 
 
 # Stores indexed cell literal metadata and precomputed character 3-grams.

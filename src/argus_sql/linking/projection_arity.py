@@ -7,10 +7,44 @@ declarative context sentences, subordinate WHERE clauses, and filter tails.
 
 import re
 
+from argus_sql.linking.token_fsm import AhoCorasickAutomaton
+
 # Matches imperative `Rank <entities> by <metric>` analytical ranking prompts.
 IMPERATIVE_RANK_RE = re.compile(
     r"^(?:please\s+)?rank\s+(?!of\b)\S+[\s\S]*\bby\b",
     re.IGNORECASE,
+)
+
+# Multi-pattern Aho-Corasick matcher for projection arity override cues.
+_ARITY_CUES_AC: AhoCorasickAutomaton[str] = AhoCorasickAutomaton(
+    patterns=(
+        # Compound multi-column address shorthands and unconstrained plural names.
+        ("full communication address", "address_4"),
+        ("complete address", "address_4"),
+        ("full names", "unconstrained_0"),
+        # Dual superlative pairs (`biggest and lowest`, `highest and lowest`, ...).
+        *(
+            (f"{hi} and {lo}", "dual_2")
+            for hi in ("biggest", "highest", "largest", "most", "maximum")
+            for lo in ("lowest", "smallest", "least", "minimum")
+        ),
+        # Explicit single-column scalar directive heads.
+        *(
+            (f"{adv} need the {opt}{noun}", "single_1")
+            for adv in ("only", "just")
+            for opt in ("", "single ")
+            for noun in (
+                "count", "total", "number", "average", "percentage", "rate",
+                "ratio", "difference", "score", "value", "name", "id",
+            )
+        ),
+        *(
+            (f"{verb}{me} the single", "single_1_prefix")
+            for verb in ("give", "show", "return")
+            for me in ("", " me")
+        ),
+    ),
+    case_sensitive=False,
 )
 
 # Detects interrogative or imperative projection cues in a head clause so
@@ -133,14 +167,19 @@ def estimate_projection_spec(canonical_q: str) -> tuple[int, bool]:
     denotes an unconstrained multi-sentence narrative prompt.
   """
   lower = canonical_q.lower()
-  # Explicit single-output directives override narrative or follow-up context.
-  if re.search(
-      r"\b(?:(?:only|just)\s+need\s+the\s+(?:single\s+)?(?:count|total|number|"
-      r"average|percentage|rate|ratio|difference|score|value|name|id)"
-      r"|(?:give|show|return)(?:\s+me)?\s+the\s+single\s+\w+)\b",
-      lower,
-  ):
+  # Single-pass Aho-Corasick lookup for explicit scalar, address, and dual cues.
+  arity_cues = _ARITY_CUES_AC.find_all(
+      lower, boundary_aware=True, resolve_overlaps=True
+  )
+  cue_tags = {m.payload for m in arity_cues}
+  if "single_1" in cue_tags:
     return (1, False)
+  for m in arity_cues:
+    if m.payload == "single_1_prefix":
+      # Verify a following noun word exists after `... the single `.
+      tail = lower[m.end :].lstrip()
+      if tail and (tail[0].isalnum() or tail[0] == "_"):
+        return (1, False)
 
   # Multi-sentence narrative briefings (>38 words or >=2 periods) frequently
   # specify custom 4..16 column schemas; leave unconstrained (`0`).
@@ -150,9 +189,9 @@ def estimate_projection_spec(canonical_q: str) -> tuple[int, bool]:
 
   # Expand compound multi-field shorthand; leave plural 'full names' unconstrained
   # because schemas represent full names across 1, 2, 3, or 6 columns.
-  if "full communication address" in lower or "complete address" in lower:
+  if "address_4" in cue_tags:
     return (4, False)
-  if "full names" in lower:
+  if "unconstrained_0" in cue_tags:
     return (0, False)
 
   # Imperative `Rank <entities> by <metric>` projects `(entity, metric, rank)`.
@@ -174,11 +213,7 @@ def estimate_projection_spec(canonical_q: str) -> tuple[int, bool]:
       return (min(len(pair_clauses), 5), False)
 
   # Detect dual superlative pairs ('biggest and lowest', 'highest and lowest').
-  if re.search(
-      r"\b(?:biggest|highest|largest|most|maximum)\s+and\s+"
-      r"(?:lowest|smallest|least|minimum)\b",
-      lower,
-  ):
+  if "dual_2" in cue_tags:
     return (2, False)
 
   # Inspect follow-up projection clauses (`? Show ...`, `and also show ...`,

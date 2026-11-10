@@ -178,3 +178,68 @@ def build_live_llm_client(
       endpoint_url=eff_endpoint,
       api_key=resolved_api_key or None,
   )
+
+
+def build_intent_llm_client(
+    provider: str = "auto",
+    model_name: str = "auto",
+    endpoint_url: str = _DEFAULT_OPENAI_ENDPOINT,
+    gcp_project: str | None = None,
+    gcp_location: str | None = None,
+    dotenv_path: pathlib.Path | None = None,
+    fallback_to_none: bool = True,
+) -> BatchLLMPort | None:
+  """Constructs a fast `flash-lite` `BatchLLMPort` for Stage 1 intent extraction.
+
+  In hermetic or unconfigured offline environments, returns `None` when
+  `fallback_to_none=True` so Stage 1 automatically uses the deterministic FSM.
+
+  Args:
+    provider: `'auto'`, `'vertex'`, or `'openai'`.
+    model_name: Intent model slug (`'auto'` picks `gemini-2.5-flash-lite` or
+      `gpt-4o-mini`, overridden by `ARGUS_INTENT_LLM_MODEL`).
+    endpoint_url: Chat completions URL when `provider` resolves to `'openai'`.
+    gcp_project: Optional GCP project override for Vertex AI.
+    gcp_location: Optional Vertex AI location override.
+    dotenv_path: Optional `.env` file path for non-secret local defaults.
+    fallback_to_none: Return `None` on missing credentials instead of raising.
+
+  Returns:
+    Configured `BatchLLMPort` or `None` when offline fallback applies.
+
+  Raises:
+    LLMAdapterAuthError: If `fallback_to_none=False` and credentials are absent.
+  """
+  cfg = load_dotenv_defaults(dotenv_path)
+  raw_model = model_name.strip()
+  if not raw_model or raw_model.lower() == "auto":
+    env_intent_model = cfg.get("ARGUS_INTENT_LLM_MODEL", "").strip()
+    # Select lightweight flash-lite / mini tier matching the resolved provider.
+    raw_proj = (gcp_project or cfg.get("GOOGLE_CLOUD_PROJECT", "")).strip()
+    is_vertex = provider.strip().lower() == "vertex" or (
+        provider.strip().lower() == "auto"
+        and bool(raw_proj and raw_proj.lower() not in _PLACEHOLDER_PROJECTS)
+    )
+    resolved_model = env_intent_model or (
+        "gemini-2.5-flash-lite" if is_vertex else "gpt-4o-mini"
+    )
+  else:
+    resolved_model = raw_model
+
+  try:
+    return build_live_llm_client(
+        provider=provider,
+        model_name=resolved_model,
+        endpoint_url=endpoint_url,
+        gcp_project=gcp_project,
+        gcp_location=gcp_location,
+        dotenv_path=dotenv_path,
+    )
+  except LLMAdapterAuthError as err:
+    if not fallback_to_none:
+      raise
+    _LOGGER.info(
+        "Intent LLM unavailable (%s); falling back to deterministic FSM.",
+        type(err).__name__,
+    )
+    return None

@@ -36,13 +36,16 @@ from argus_sql.sandbox.sqlite_sandbox import SQLiteReadOnlySandbox
 
 
 def build_main_systems(
-    llm: BatchLLMPort, sandbox: SQLiteReadOnlySandbox
+    llm: BatchLLMPort,
+    sandbox: SQLiteReadOnlySandbox,
+    intent_llm: BatchLLMPort | None = None,
 ) -> tuple[NL2SQLPipeline, ...]:
   """Constructs B0, B0+, B1, B2, B3, B4, and full Argus-SQL operator pipelines.
 
   Args:
     llm: BatchLLMPort completion adapter shared across all systems.
     sandbox: Read-only SQLite execution sandbox.
+    intent_llm: Optional fast `flash-lite` Stage 1 intent extraction adapter.
 
   Returns:
     Seven-element tuple of progressive controlled operator NL2SQL pipelines.
@@ -55,7 +58,12 @@ def build_main_systems(
       ExecRefinerPipeline(llm, sandbox),
       ValueMajorityVotePipeline(llm, sandbox),
       LLMJudgePipeline(llm, sandbox),
-      ArgusSQLPipeline(llm, sandbox, ArgusAblationConfig(system_name="Argus-SQL")),
+      ArgusSQLPipeline(
+          llm,
+          sandbox,
+          ArgusAblationConfig(system_name="Argus-SQL"),
+          intent_llm=intent_llm,
+      ),
   )
 
 

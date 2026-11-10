@@ -20,7 +20,8 @@ from argus_sql.contracts.types import PipelinePrediction
 from argus_sql.contracts.types import QueryDifficulty
 from argus_sql.contracts.types import SQLCandidate
 from argus_sql.linking.fk_schema_linker import link_schema_with_fk_closure
-from argus_sql.linking.intent_canonicalizer import canonicalize_intent
+from argus_sql.linking.llm_intent_extractor import canonicalize_intent_with_optional_llm
+from argus_sql.linking.types import IntentExtractorPort
 from argus_sql.linking.types import SchemaLinkerConfig
 from argus_sql.linking.value_retriever import CellValueRetriever
 from argus_sql.pipelines.prompt_templates import SQLITE_SYSTEM_PROMPT
@@ -98,6 +99,7 @@ class ArgusSQLPipeline:
       llm: BatchLLMPort,
       sandbox: SQLiteReadOnlySandbox,
       config: ArgusAblationConfig | None = None,
+      intent_llm: BatchLLMPort | IntentExtractorPort | None = None,
   ) -> None:
     """Initializes Argus-SQL with swappable adapters and ablation flags.
 
@@ -105,30 +107,47 @@ class ArgusSQLPipeline:
       llm: BatchLLMPort completion adapter.
       sandbox: Read-only SQLite execution sandbox.
       config: Optional ArgusAblationConfig for leave-one-out ablation sweeps.
+      intent_llm: Optional fast `flash-lite` Stage 1 intent extractor port.
     """
     self._llm = llm
     self._sandbox = sandbox
     self._config = config or ArgusAblationConfig()
+    self._intent_llm = intent_llm
 
   @property
   def system_name(self) -> str:
     """Returns configured system or ablation label."""
     return self._config.system_name
 
+  def _build_intent_with_tokens(self, task: NLQueryTask) -> tuple[IntentFrame, int]:
+    """Canonicalizes intent via optional flash-lite port or deterministic FSM."""
+    if self._config.enable_voice_canonicalizer:
+      extractor = (
+          self._intent_llm
+          if (self._intent_llm is not None or self._config.enable_llm_intent_extractor)
+          else None
+      )
+      return canonicalize_intent_with_optional_llm(
+          task.question, task.evidence, extractor=extractor
+      )
+    return (
+        IntentFrame(
+            raw_question=task.question,
+            canonical_question=task.question.strip(),
+            disfluencies_removed=0,
+            entities=(),
+            requires_floating_division=("/" in task.evidence),
+            requires_extrema_order=False,
+            expected_projection_arity=1,
+            complexity=QueryDifficulty.MODERATE,
+        ),
+        0,
+    )
+
   def _build_intent(self, task: NLQueryTask) -> IntentFrame:
     """Canonicalizes spoken/written intent when enabled, else wraps raw text."""
-    if self._config.enable_voice_canonicalizer:
-      return canonicalize_intent(task.question, task.evidence)
-    return IntentFrame(
-        raw_question=task.question,
-        canonical_question=task.question.strip(),
-        disfluencies_removed=0,
-        entities=(),
-        requires_floating_division=("/" in task.evidence),
-        requires_extrema_order=False,
-        expected_projection_arity=1,
-        complexity=QueryDifficulty.MODERATE,
-    )
+    intent, _ = self._build_intent_with_tokens(task)
+    return intent
 
   def predict(
       self,
@@ -151,8 +170,8 @@ class ArgusSQLPipeline:
     start_ns = time.perf_counter_ns()
     cfg = self._config
 
-    # Stage 1: Voice & Intent Canonicalization.
-    intent = self._build_intent(task)
+    # Stage 1: Voice & Intent Canonicalization (FSM + optional flash-lite pass).
+    intent, intent_tokens = self._build_intent_with_tokens(task)
 
     # Stage 2: 3-Gram Cell Value Grounding + Steiner FK-Closure Schema Linking.
     # Reuse caller-supplied `value_retriever` so per-DB indexing runs once.
@@ -205,7 +224,7 @@ class ArgusSQLPipeline:
     )
     # Dispatch selected strategies concurrently via BatchLLMPort.
     resps = self._llm.batch_complete(batch_reqs)
-    total_tokens = sum(r.logical_tokens for r in resps)
+    total_tokens = intent_tokens + sum(r.logical_tokens for r in resps)
 
     # Wrap raw completion strings into immutable SQLCandidate contracts.
     candidates: list[SQLCandidate] = [
@@ -353,6 +372,7 @@ class ArgusSQLPipeline:
         ("bridge_tables", ",".join(linked.bridge_tables_added)),
         ("grounded_values", str(len(linked.value_matches))),
         ("disfluencies_removed", str(intent.disfluencies_removed)),
+        ("intent_tokens", str(intent_tokens)),
     )
     # Emit immutable prediction contract containing winning SQL and trace.
     return PipelinePrediction(

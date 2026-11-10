@@ -15,6 +15,7 @@ import pathlib
 import sys
 import tempfile
 
+from argus_sql.adapters.client_factory import build_intent_llm_client
 from argus_sql.adapters.client_factory import build_live_llm_client
 from argus_sql.adapters.deterministic_synthesizer import SchemaGuidedDiagnosticSynthesizer
 from argus_sql.evaluation.bird_loader import load_bird_split
@@ -108,6 +109,12 @@ def _build_arg_parser() -> argparse.ArgumentParser:
   parser.add_argument("--gcp-project", type=str, default=None)
   parser.add_argument("--gcp-location", type=str, default=None)
   parser.add_argument("--model", type=str, default="auto")
+  parser.add_argument(
+      "--intent-model",
+      type=str,
+      default="off",
+      help="Optional Stage 1 flash-lite intent model ('off', 'auto', or slug).",
+  )
   parser.add_argument(
       "--endpoint-url", type=str, default="https://api.openai.com/v1/chat/completions"
   )
@@ -275,11 +282,32 @@ def main(argv: Sequence[str] | None = None) -> int:
     for sys_id in (s.strip() for s in args.recompute_systems.split(",") if s.strip()):
       checkpointer.invalidate_system(sys_id)
 
+  # Optionally construct lightweight Stage 1 flash-lite intent extractor.
+  intent_llm = (
+      build_intent_llm_client(
+          provider=args.provider,
+          model_name=args.intent_model,
+          endpoint_url=args.endpoint_url,
+          gcp_project=args.gcp_project,
+          gcp_location=args.gcp_location,
+          fallback_to_none=True,
+      )
+      if args.intent_model.strip().lower() != "off"
+      else None
+  )
+
   # Support `--only-argus` for rapid low-token smoke checks on live endpoints.
   pipes: tuple[NL2SQLPipeline, ...] = (
-      (ArgusSQLPipeline(llm_client, sandbox, ArgusAblationConfig(system_name="Argus-SQL")),)
+      (
+          ArgusSQLPipeline(
+              llm_client,
+              sandbox,
+              ArgusAblationConfig(system_name="Argus-SQL"),
+              intent_llm=intent_llm,
+          ),
+      )
       if args.only_argus
-      else build_main_systems(llm_client, sandbox)
+      else build_main_systems(llm_client, sandbox, intent_llm=intent_llm)
   )
   # Execute identical task subsets concurrently across Clean and Voice splits.
   clean_rep = run_benchmark_suite(

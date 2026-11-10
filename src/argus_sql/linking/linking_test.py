@@ -519,6 +519,149 @@ class LinkingModuleTest(unittest.TestCase):
     self.assertEqual(asr_unpunct.expected_projection_arity, 2)
     self.assertTrue(asr_unpunct.has_followup_projection)
 
+  def test_aho_corasick_automaton_and_token_fsm_primitives(self) -> None:
+    """Aho-Corasick resolves overlaps, boundaries, and compound tokens in 1 pass."""
+    from argus_sql.linking.token_fsm import AhoCorasickAutomaton
+    from argus_sql.linking.token_fsm import tokenize_utterance
+
+    ac = AhoCorasickAutomaton(
+        patterns=(
+            ("calif.", "California"),
+            ("calif", "California"),
+            ("l.a. county", "Los Angeles"),
+            ("county", "COUNTY_GENERIC"),
+        ),
+        case_sensitive=False,
+    )
+    # Longest non-overlapping match wins (`l.a. county` beats `county`; `calif.`
+    # beats `calif`) while partial-word `california` does NOT trigger `calif`.
+    text = "schools in l.a. county and calif. vs california"
+    matches = ac.find_all(text, boundary_aware=True, resolve_overlaps=True)
+    self.assertEqual(
+        [(m.pattern, m.payload) for m in matches],
+        [("l.a. county", "Los Angeles"), ("calif.", "California")],
+    )
+    replaced = ac.replace_all(text, boundary_aware=True)
+    self.assertEqual(
+        replaced, "schools in Los Angeles and California vs california"
+    )
+
+    # Single-pass tokenizer keeps quotes separate from possessives and preserves
+    # compound codes (`TR004_8_9`, `K-12`, `0:01:27`).
+    toks = tokenize_utterance(
+        "Indicate the school's TR004_8_9 score in 'Magnet' K-12 at 0:01:27."
+    )
+    self.assertIn(("WORD", "TR004_8_9"), [(t.kind, t.raw) for t in toks])
+    self.assertIn(("QUOTE", "'Magnet'"), [(t.kind, t.raw) for t in toks])
+    self.assertIn(("WORD", "K-12"), [(t.kind, t.raw) for t in toks])
+    self.assertIn(("NUMBER", "0:01:27"), [(t.kind, t.raw) for t in toks])
+
+  def test_flash_lite_intent_extractor_structured_json_and_fallbacks(
+      self,
+  ) -> None:
+    """Optional flash-lite LLM extractor parses JSON and falls back cleanly."""
+    from argus_sql.adapters.deterministic_synthesizer import SchemaGuidedDiagnosticSynthesizer
+    from argus_sql.adapters.exceptions import LLMAdapterTransportError
+    from argus_sql.adapters.types import LLMCompletionRequest
+    from argus_sql.adapters.types import LLMCompletionResponse
+    from argus_sql.linking.llm_intent_extractor import FlashLiteIntentExtractor
+    from argus_sql.linking.llm_intent_extractor import canonicalize_intent_with_optional_llm
+
+    class _FakeFlashLiteLLM:
+      """Mock BatchLLMPort returning structured JSON intent completions."""
+
+      def __init__(self, payloads: tuple[str, ...]) -> None:
+        """Initializes fake batch LLM with canned JSON response strings."""
+        self.calls = 0
+        self._payloads = payloads
+
+      def batch_complete(
+          self, requests: tuple[LLMCompletionRequest, ...]
+      ) -> tuple[LLMCompletionResponse, ...]:
+        """Returns aligned canned responses for `requests`.
+
+        Args:
+          requests: Batch of completion requests.
+
+        Returns:
+          Tuple of mock `LLMCompletionResponse` objects.
+        """
+        self.calls += 1
+        return tuple(
+            LLMCompletionResponse(
+                request_id=req.request_id,
+                sql_text="",
+                raw_text=self._payloads[idx],
+                prompt_tokens=40,
+                completion_tokens=25,
+            )
+            for idx, req in enumerate(requests)
+        )
+
+    class _FailingLLM:
+      """Mock BatchLLMPort simulating transport failure."""
+
+      def batch_complete(
+          self, requests: tuple[LLMCompletionRequest, ...]
+      ) -> tuple[LLMCompletionResponse, ...]:
+        """Raises `LLMAdapterTransportError` to test deterministic fallback.
+
+        Args:
+          requests: Batch of completion requests.
+        """
+        del requests
+        raise LLMAdapterTransportError("network unreachable")
+
+    # 1. Valid markdown-fenced JSON from flash-lite overrides structured fields.
+    valid_json = (
+        "```json\n"
+        '{"canonical_question": "What is the default rate in California?", '
+        '"entities": ["California", "Defaulted"], '
+        '"expected_projection_arity": 2, '
+        '"requires_floating_division": true, '
+        '"requires_extrema_order": false, '
+        '"complexity": "challenging"}\n'
+        "```"
+    )
+    fake_llm = _FakeFlashLiteLLM((valid_json,))
+    extractor = FlashLiteIntentExtractor(llm=fake_llm)
+    frame, tokens = canonicalize_intent_with_optional_llm(
+        "uh hey what is the the default rate in calif",
+        extractor=extractor,
+    )
+    self.assertEqual(fake_llm.calls, 1)
+    self.assertEqual(tokens, 65)
+    self.assertEqual(
+        frame.canonical_question, "What is the default rate in California?"
+    )
+    self.assertEqual(frame.entities, ("California", "Defaulted"))
+    self.assertEqual(frame.expected_projection_arity, 2)
+    self.assertTrue(frame.requires_floating_division)
+    self.assertFalse(frame.requires_extrema_order)
+    self.assertEqual(frame.complexity, QueryDifficulty.CHALLENGING)
+
+    # 2. Automatic fallback to deterministic FSM when offline/hermetic/failing:
+    #    (a) llm=None, (b) deterministic SQL synthesizer, (c) transport error,
+    #    (d) malformed non-JSON string.
+    q = "uh show me the top five schools in Calif?"
+    expected_fsm = canonicalize_intent(q)
+    f_none, t_none = canonicalize_intent_with_optional_llm(q, extractor=None)
+    self.assertEqual(f_none, expected_fsm)
+    self.assertEqual(t_none, 0)
+
+    f_hermetic = FlashLiteIntentExtractor(
+        llm=SchemaGuidedDiagnosticSynthesizer()
+    ).extract_intent(q)
+    self.assertEqual(f_hermetic, expected_fsm)
+
+    f_err = FlashLiteIntentExtractor(llm=_FailingLLM()).extract_intent(q)
+    self.assertEqual(f_err, expected_fsm)
+
+    f_bad = FlashLiteIntentExtractor(
+        llm=_FakeFlashLiteLLM(("not json at all",))
+    ).extract_intent(q)
+    self.assertEqual(f_bad, expected_fsm)
+
 
 if __name__ == "__main__":
   unittest.main()
