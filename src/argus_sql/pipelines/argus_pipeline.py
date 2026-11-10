@@ -13,6 +13,7 @@ import time
 from argus_sql.adapters.types import BatchLLMPort
 from argus_sql.adapters.types import LLMCompletionRequest
 from argus_sql.contracts.types import DatabaseSchema
+from argus_sql.contracts.types import ExecutionOutcome
 from argus_sql.contracts.types import IntentFrame
 from argus_sql.contracts.types import NLQueryTask
 from argus_sql.contracts.types import PipelinePrediction
@@ -26,11 +27,67 @@ from argus_sql.pipelines.prompt_templates import SQLITE_SYSTEM_PROMPT
 from argus_sql.pipelines.prompt_templates import build_strategy_request
 from argus_sql.pipelines.types import ArgusAblationConfig
 from argus_sql.sandbox.sqlite_sandbox import SQLiteReadOnlySandbox
+from argus_sql.sandbox.sqlite_sandbox import normalize_sql_for_dedup
 from argus_sql.verification.consensus_arbiter import verify_and_rank_candidates
 from argus_sql.verification.semantic_verifier import audit_candidate_invariants
 from argus_sql.verification.sql_repairer import apply_algebraic_sql_repairs
 from argus_sql.verification.sql_repairer import build_diagnostic_repair_prompt
 from argus_sql.verification.types import VerifierConfig
+
+
+def _is_empty_or_all_null(outcome: ExecutionOutcome) -> bool:
+  """Returns True when `outcome` returned 0 rows or a single all-NULL row."""
+  return outcome.row_count == 0 or (
+      outcome.row_count == 1
+      and bool(outcome.rows)
+      and all(cell is None for cell in outcome.rows[0])
+  )
+
+
+def _merge_algebraic_repair(
+    candidates: list[SQLCandidate],
+    outcomes: list[ExecutionOutcome],
+    repaired_flags: list[bool],
+    orig_idx: int,
+    rep_cand: SQLCandidate,
+    rep_out: ExecutionOutcome,
+) -> None:
+  """Merges a succeeded algebraic rewrite without double-counting support."""
+  # Ignore failed rewrites or whitespace-only no-ops matching parent SQL.
+  if not rep_out.succeeded:
+    return
+  orig_cand = candidates[orig_idx]
+  orig_out = outcomes[orig_idx]
+  if normalize_sql_for_dedup(rep_cand.sql) == normalize_sql_for_dedup(
+      orig_cand.sql
+  ):
+    return
+
+  orig_empty_or_null = _is_empty_or_all_null(orig_out)
+  rep_empty_or_null = _is_empty_or_all_null(rep_out)
+  # Discard algebraic rewrites (e.g., `AND col IS NOT NULL`) that wipe out a
+  # valid non-empty parent result into 0 rows or an all-NULL scalar row.
+  if orig_out.succeeded and not orig_empty_or_null and rep_empty_or_null:
+    return
+
+  same_output = (
+      orig_out.succeeded
+      and bool(rep_out.result_signature)
+      and rep_out.result_signature == orig_out.result_signature
+  )
+  both_empty_or_null = (
+      orig_out.succeeded and orig_empty_or_null and rep_empty_or_null
+  )
+  # Upgrade in-place when execution output matches parent (or both stay empty)
+  # so dialect cleanup never inflates cluster vote count!
+  if orig_out.succeeded and (same_output or both_empty_or_null):
+    candidates[orig_idx] = rep_cand
+    outcomes[orig_idx] = rep_out
+    repaired_flags[orig_idx] = True
+  else:
+    candidates.append(rep_cand)
+    outcomes.append(rep_out)
+    repaired_flags.append(True)
 
 
 class ArgusSQLPipeline:
@@ -186,23 +243,9 @@ class ArgusSQLPipeline:
         for (orig_idx, rep_c), rep_o in zip(
             algebraic_repairs, rep_outcomes, strict=True
         ):
-          if not rep_o.succeeded:
-            continue
-          still_empty_or_null = rep_o.row_count == 0 or (
-              rep_o.row_count == 1
-              and bool(rep_o.rows)
-              and all(cell is None for cell in rep_o.rows[0])
+          _merge_algebraic_repair(
+              candidates, outcomes, repaired_flags, orig_idx, rep_c, rep_o
           )
-          # Upgrade in-place when both original and rewrite are empty/all-NULL
-          # so Stage 4b gets clean casing without doubling EMPTY_SET votes!
-          if outcomes[orig_idx].succeeded and still_empty_or_null:
-            candidates[orig_idx] = rep_c
-            outcomes[orig_idx] = rep_o
-            repaired_flags[orig_idx] = True
-          else:
-            candidates.append(rep_c)
-            outcomes.append(rep_o)
-            repaired_flags.append(True)
 
     # Stage 4b: Optional LLM Diagnostic Repair only when zero error-free SQL exists.
     # Soft heuristic warnings (e.g., arity estimates) do not burn extra LLM calls.
@@ -268,9 +311,10 @@ class ArgusSQLPipeline:
         candidates.append(rep_cand)
         outcomes.append(rep_out)
         repaired_flags.append(True)
+        llm_idx = len(candidates) - 1
 
         # Harden LLM-repaired SQL with zero-token algebraic dialect rewrites
-        # (e.g., `SELECT DISTINCT` or `CAST(... AS REAL)`) if needed.
+        # without duplicating votes if the rewrite output matches `rep_out`.
         if cfg.enable_semantic_verifier and cfg.enable_algebraic_repair:
           rep_issues = audit_candidate_invariants(
               rep_cand, rep_out, intent, linked
@@ -279,9 +323,14 @@ class ArgusSQLPipeline:
             post_alg = apply_algebraic_sql_repairs(rep_cand, rep_issues, linked)
             if post_alg is not None:
               post_out = self._sandbox.execute(db_path, post_alg.sql)
-              candidates.append(post_alg)
-              outcomes.append(post_out)
-              repaired_flags.append(True)
+              _merge_algebraic_repair(
+                  candidates,
+                  outcomes,
+                  repaired_flags,
+                  llm_idx,
+                  post_alg,
+                  post_out,
+              )
 
     # Stage 4c: Invariant-Weighted Execution Consensus Arbitration.
     # Penalizes integer-truncated or NULL-order-vulnerable clusters automatically.

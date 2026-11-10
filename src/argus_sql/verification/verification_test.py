@@ -612,6 +612,324 @@ class VerificationAndArbiterTest(unittest.TestCase):
     )
     self.assertEqual(win_calc.outcome.result_signature, sig_good)
 
+  def test_iteration5_lineage_dedup_projection_tiebreak_wildcard_and_followup(
+      self,
+  ) -> None:
+    """Covers QID 24 lineage dedup, QID 159 `*`/tie-break, & QID 1157/866_voice."""
+    # 1. QID 24: Derived repair copy (`skeleton_minimal+argus_repair`) sharing
+    #    an execution cluster with its parent (`skeleton_minimal`) must NOT
+    #    inflate cluster score to `0.18 + 1.00 = 1.18` or earn diversity bonus,
+    #    and projection-name alignment (`School Name` vs `sname`) breaks the
+    #    `1.0` vs `1.0` tie ahead of execution latency (`8.0ms` vs `0.2ms`)!
+    intent_24 = canonicalize_intent(
+        "Give the names of the schools with the percent eligible for free "
+        "meals in K-12 is more than 0.1 and test takers whose test score is "
+        "greater than or equal to 1500?",
+        evidence=(
+            "Percent eligible for free meals = "
+            "Free Meal Count (K-12) / Total (Enrollment (K-12)"
+        ),
+    )
+    sig_sname = compute_result_signature((("East Los Angeles Performing",),))
+    sig_full = compute_result_signature(
+        (("East Los Angeles Performing Arts Academy",),)
+    )
+    c_skel_raw = SQLCandidate(
+        'SELECT T1.sname FROM satscores AS T1 INNER JOIN frpm AS T2 '
+        'ON T1.cds = T2.CDSCode WHERE T2."Free Meal Count (K-12)" / '
+        'T2."Enrollment (K-12)" > 0.1 AND T1.NumGE1500 > 0',
+        "skeleton_minimal",
+    )
+    c_skel_rep = SQLCandidate(
+        'SELECT T1.sname FROM satscores AS T1 INNER JOIN frpm AS T2 '
+        'ON T1.cds = T2.CDSCode WHERE CAST(T2."Free Meal Count (K-12)" AS REAL)'
+        ' / NULLIF(T2."Enrollment (K-12)", 0) > 0.1 AND T1.NumGE1500 > 0',
+        "skeleton_minimal+argus_repair",
+    )
+    c_cot_full = SQLCandidate(
+        'SELECT T2."School Name" FROM satscores AS T1 INNER JOIN frpm AS T2 '
+        'ON T1.cds = T2.CDSCode WHERE CAST(T2."Free Meal Count (K-12)" AS REAL)'
+        ' / T2."Enrollment (K-12)" > 0.1 AND T1.NumGE1500 > 0',
+        "decomposed_cot",
+    )
+    # Give `sname` candidates 40x faster latency (`0.2ms` vs `8.0ms`) to prove
+    # projection-name alignment takes precedence over raw latency!
+    o_sname = ExecutionOutcome(
+        True, (("East Los Angeles Performing",),), ("sname",), 1, 0.2, "", sig_sname
+    )
+    o_full = ExecutionOutcome(
+        True,
+        (("East Los Angeles Performing Arts Academy",),),
+        ("School Name",),
+        1,
+        8.0,
+        "",
+        sig_full,
+    )
+    win_24, _, clusters_24 = verify_and_rank_candidates(
+        (c_skel_raw, c_skel_rep, c_cot_full),
+        (o_sname, o_sname, o_full),
+        intent_24,
+        repaired_flags=(False, True, False),
+    )
+    by_sig_24 = {c.result_signature: c for c in clusters_24}
+    self.assertEqual(by_sig_24[sig_sname].distinct_strategies, ("skeleton_minimal",))
+    self.assertEqual(by_sig_24[sig_sname].total_score, 1.0)
+    self.assertEqual(win_24.outcome.result_signature, sig_full)
+    self.assertEqual(win_24.candidate.strategy, "decomposed_cot")
+
+    # Even two completely clean derived copies (`s1`, `s1+argus_repair`,
+    # `s1_repair`) collapse to score 1.0 with zero fake diversity bonus!
+    _, _, clean_dup_clusters = verify_and_rank_candidates(
+        (
+            SQLCandidate("SELECT 1", "s1"),
+            SQLCandidate("SELECT 1", "s1+argus_repair"),
+            SQLCandidate("SELECT 1", "s1_repair"),
+        ),
+        (o_sname, o_sname, o_sname),
+        canonicalize_intent("How many records?"),
+    )
+    self.assertEqual(clean_dup_clusters[0].distinct_strategies, ("s1",))
+    self.assertEqual(clean_dup_clusters[0].total_score, 1.0)
+
+    # 2. QID 159: `SELECT T1.*` / `SELECT *` escalates to `ERROR` whenever
+    #    `expected_projection_arity <= 2`, while keeping `WARNING` at arity >= 3,
+    #    ignoring `COUNT(*)` / CTE subqueries, and breaking within-cluster ties
+    #    by projection header (`trans_id` > `client_id` / `amount`) before speed!
+    intent_159 = canonicalize_intent(
+        "List all the withdrawals in cash transactions that the client with "
+        "the id 3356 makes.",
+        evidence="operation = 'VYBER' refers to withdrawal in cash",
+    )
+    self.assertEqual(intent_159.expected_projection_arity, 1)
+    star_cand = SQLCandidate(
+        "SELECT T1.* FROM trans AS T1 INNER JOIN disp AS T2 "
+        "ON T1.account_id = T2.account_id WHERE T2.client_id = 3356 "
+        "AND T1.operation = 'VYBER'",
+        "decomposed_cot",
+    )
+    wide_cols = ("trans_id", "account_id", "date", "type", "operation", "amount")
+    wide_rows = ((991, 44, "1996-01-01", "VYDAJ", "VYBER", 500),)
+    star_out = ExecutionOutcome(
+        True, wide_rows, wide_cols, 1, 0.2, "", compute_result_signature(wide_rows)
+    )
+    star_issues = audit_candidate_invariants(star_cand, star_out, intent_159)
+    self.assertEqual(len(star_issues), 1)
+    self.assertEqual(star_issues[0].code, "PROJECTION_ARITY_DRIFT")
+    self.assertEqual(star_issues[0].severity, "ERROR")
+
+    # Arity 2 (`expected <= 2`) `SELECT *` on a 3-col table also flags `ERROR`,
+    # whereas `expected == 3` (`> 2`) `SELECT *` and explicit 3-col over-projection
+    # stay `WARNING`, and `WITH cte AS (SELECT * ...) SELECT trans_id` is clean!
+    intent_arity2 = canonicalize_intent(
+        "Who was the player that got the lap time of 0:01:27? "
+        "Show his introduction website."
+    )
+    three_out = ExecutionOutcome(
+        True,
+        ((1, "Lewis", "u"),),
+        ("id", "name", "url"),
+        1,
+        0.3,
+        "",
+        compute_result_signature(((1, "Lewis", "u"),)),
+    )
+    arity2_star = audit_candidate_invariants(
+        SQLCandidate("SELECT * FROM drivers", "cot"), three_out, intent_arity2
+    )
+    self.assertEqual(arity2_star[0].severity, "ERROR")
+
+    intent_arity3 = canonicalize_intent(
+        "For patients with severe degree of thrombosis, list their ID, sex "
+        "and disease the patient is diagnosed with."
+    )
+    arity3_star = audit_candidate_invariants(
+        SQLCandidate("SELECT * FROM Patient", "cot"), star_out, intent_arity3
+    )
+    self.assertEqual(arity3_star[0].severity, "WARNING")
+    explicit_over = audit_candidate_invariants(
+        SQLCandidate("SELECT trans_id, account_id, amount FROM trans", "cot"),
+        three_out,
+        intent_159,
+    )
+    self.assertEqual(explicit_over[0].severity, "WARNING")
+
+    cte_star_clean = SQLCandidate(
+        "WITH c AS (SELECT * FROM trans WHERE operation = 'VYBER') "
+        "SELECT trans_id FROM c",
+        "formula_defensive",
+    )
+    id_sig = compute_result_signature(((991,),))
+    id_out_slow = ExecutionOutcome(True, ((991,),), ("trans_id",), 1, 9.5, "", id_sig)
+    client_out_fast = ExecutionOutcome(
+        True, ((991,),), ("client_id",), 1, 0.2, "", id_sig
+    )
+    self.assertEqual(
+        audit_candidate_invariants(cte_star_clean, id_out_slow, intent_159), ()
+    )
+    # Within-cluster and vs-3-wildcard-votes: `trans_id` wins despite 9.5ms!
+    win_159, _, _ = verify_and_rank_candidates(
+        (
+            star_cand,
+            SQLCandidate(star_cand.sql, "skeleton_minimal"),
+            SQLCandidate("SELECT client_id FROM disp", "s_fast"),
+            cte_star_clean,
+        ),
+        (star_out, star_out, client_out_fast, id_out_slow),
+        intent_159,
+    )
+    self.assertEqual(win_159.candidate.sql, cte_star_clean.sql)
+
+    # 3. QID 1157 & `866_voice`: 3-col `'their'` query passes cleanly while
+    #    1-col SQL on `866_voice` follow-up is flagged so 3-col beats 2x 1-col!
+    clean_1157_sql = SQLCandidate(
+        "SELECT DISTINCT T1.ID, T1.SEX, T1.Diagnosis FROM Patient AS T1 "
+        "INNER JOIN Examination AS T2 ON T1.ID = T2.ID WHERE T2.Thrombosis = 2",
+        "decomposed_cot",
+    )
+    out_1157 = ExecutionOutcome(
+        True,
+        ((7, "F", "SLE"),),
+        ("ID", "SEX", "Diagnosis"),
+        1,
+        0.5,
+        "",
+        compute_result_signature(((7, "F", "SLE"),)),
+    )
+    self.assertEqual(
+        audit_candidate_invariants(clean_1157_sql, out_1157, intent_arity3), ()
+    )
+
+    intent_866v = canonicalize_intent(
+        "uh hey can you please tell me who was the you know player that got "
+        "the lap time of 0:01:27 in the race no. 161? show his introduction "
+        "website",
+        evidence="player and driver are synonyms; introduction website refers to url;",
+    )
+    c_url_cot = SQLCandidate(
+        "SELECT DISTINCT T1.url FROM drivers T1 JOIN lapTimes T2 "
+        "ON T1.driverId = T2.driverId WHERE T2.raceId = 161 AND T2.time LIKE '1:27%'",
+        "decomposed_cot",
+    )
+    c_url_skel = SQLCandidate(c_url_cot.sql, "skeleton_minimal")
+    c_full_def = SQLCandidate(
+        "SELECT DISTINCT T1.forename, T1.surname, T1.url FROM drivers T1 "
+        "JOIN lapTimes T2 ON T1.driverId = T2.driverId "
+        "WHERE T2.raceId = 161 AND T2.time LIKE '1:27%'",
+        "formula_defensive",
+    )
+    sig_url = compute_result_signature((("http://example.org/driver",),))
+    sig_drv = compute_result_signature((("Kimi", "Raikkonen", "http://example.org/driver"),))
+    o_url = ExecutionOutcome(
+        True, (("http://example.org/driver",),), ("url",), 1, 0.4, "", sig_url
+    )
+    o_drv = ExecutionOutcome(
+        True,
+        (("Kimi", "Raikkonen", "http://example.org/driver"),),
+        ("forename", "surname", "url"),
+        1,
+        1.2,
+        "",
+        sig_drv,
+    )
+    url_issues = audit_candidate_invariants(c_url_cot, o_url, intent_866v)
+    self.assertEqual([i.code for i in url_issues], ["PROJECTION_ARITY_DRIFT"])
+    self.assertEqual(audit_candidate_invariants(c_full_def, o_drv, intent_866v), ())
+    win_866v, _, _ = verify_and_rank_candidates(
+        (c_url_cot, c_url_skel, c_full_def), (o_url, o_url, o_drv), intent_866v
+    )
+    self.assertEqual(win_866v.outcome.result_signature, sig_drv)
+
+  def test_declarative_context_1col_attribute_tiebreak_and_error_rank_guard(
+      self,
+  ) -> None:
+    """Prevents 2-sentence 1-col drift, `<entity>_id` inversion, & ERROR wins."""
+    from argus_sql.verification.types import VerifierConfig
+
+    # 1. Two-sentence `[Declarative context]. [1-col question]` keeps 1-column
+    #    `SELECT COUNT(*)` clean so 2 agreeing strategies beat 1 noisy 2-col SQL.
+    ctx_intent = canonicalize_intent(
+        "Charter schools refer to Charter = 1 in frpm. "
+        "What is the total number of charter schools?"
+    )
+    sig_two = compute_result_signature(((1, 42),))
+    sig_one = compute_result_signature(((42,),))
+    c_noisy = SQLCandidate(
+        "SELECT Charter, COUNT(*) FROM frpm WHERE Charter = 1",
+        "skeleton_minimal",
+    )
+    c_clean1 = SQLCandidate(
+        "SELECT COUNT(*) FROM frpm WHERE Charter = 1", "decomposed_cot"
+    )
+    c_clean2 = SQLCandidate(c_clean1.sql, "formula_defensive")
+    o_noisy = ExecutionOutcome(
+        True, ((1, 42),), ("Charter", "COUNT(*)"), 1, 0.3, "", sig_two
+    )
+    o_clean = ExecutionOutcome(
+        True, ((42,),), ("COUNT(*)",), 1, 0.4, "", sig_one
+    )
+    self.assertEqual(audit_candidate_invariants(c_clean1, o_clean, ctx_intent), ())
+    ctx_win, _, _ = verify_and_rank_candidates(
+        (c_noisy, c_clean1, c_clean2), (o_noisy, o_clean, o_clean), ctx_intent
+    )
+    self.assertEqual(ctx_win.outcome.result_signature, sig_one)
+
+    # 2. Requested 1-token attribute (`email`, `date`, `amount`) must strictly
+    #    outscore 2-token `<entity>_id` (`client_id`, `trans_id`) even when
+    #    `"id"` appears in a `WHERE` filter (`with id 3356`) and latency lags.
+    sig_target = compute_result_signature((("target_val",),))
+    sig_wrong = compute_result_signature((("3356",),))
+    for q_text, target_col, wrong_col in (
+        ("What is the email of the client with id 3356?", "email", "client_id"),
+        (
+            "What is the date of the transaction that the client with id 3356 makes?",
+            "date",
+            "trans_id",
+        ),
+        ("What is the amount of the transaction with id 3356?", "amount", "trans_id"),
+        ("For the client with id 3356, what is the email?", "email", "client_id"),
+    ):
+      q_intent = canonicalize_intent(q_text)
+      o_wrong = ExecutionOutcome(
+          True, (("3356",),), (wrong_col,), 1, 0.1, "", sig_wrong
+      )
+      o_target = ExecutionOutcome(
+          True, (("target_val",),), (target_col,), 1, 8.5, "", sig_target
+      )
+      win_attr, _, _ = verify_and_rank_candidates(
+          (
+              SQLCandidate(f"SELECT {wrong_col} FROM t", "s_wrong"),
+              SQLCandidate(f"SELECT {target_col} FROM t", "s_target"),
+          ),
+          (o_wrong, o_target),
+          q_intent,
+      )
+      self.assertEqual(win_attr.candidate.strategy, "s_target")
+
+    # 3. Within a cluster containing both an ERROR-free (WARNING-only) member
+    #    and an ERROR member, `best_idx` always prefers the non-ERROR member.
+    warn_cand = SQLCandidate(
+        "SELECT email FROM clients ORDER BY pts ASC LIMIT 1", "s_warn"
+    )
+    err_cand = SQLCandidate("SELECT * FROM clients", "s_err")
+    shared_rows = (("a@b.org", 1, 2),)
+    shared_sig = compute_result_signature(shared_rows)
+    shared_out = ExecutionOutcome(
+        True, shared_rows, ("email", "c2", "c3"), 1, 0.5, "", shared_sig
+    )
+    # Configure 2 WARNINGs (`0.4 * 0.4 = 0.16`) < 1 ERROR (`0.50`) numerically
+    # to prove `_candidate_rank_key` enforces `has_no_error` ahead of weight!
+    custom_cfg = VerifierConfig(
+        error_issue_multiplier=0.50, warning_issue_multiplier=0.40
+    )
+    non_err_win, _, _ = verify_and_rank_candidates(
+        (err_cand, warn_cand),
+        (shared_out, shared_out),
+        canonicalize_intent("What is the email of the client?"),
+        config=custom_cfg,
+    )
+    self.assertEqual(non_err_win.candidate.strategy, "s_warn")
+
 
 if __name__ == "__main__":
   unittest.main()

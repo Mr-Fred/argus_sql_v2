@@ -13,6 +13,7 @@ from argus_sql.contracts.types import InvariantIssue
 from argus_sql.contracts.types import LinkedSchemaContext
 from argus_sql.contracts.types import SQLCandidate
 from argus_sql.verification.dialect_invariants import check_missing_window_rank
+from argus_sql.verification.dialect_invariants import check_projection_arity_drift
 from argus_sql.verification.dialect_invariants import check_timestamp_bare_date_comparison
 from argus_sql.verification.relational_invariants import check_boolean_avg_for_count
 from argus_sql.verification.relational_invariants import check_left_join_filtered_ratio
@@ -269,32 +270,11 @@ def audit_candidate_invariants(
             )
         )
 
-  # 6. Check projection arity alignment when non-empty rows were returned.
-  # Allow +-1 column slack unless `calculation =` mandates a strict 1-col scalar.
-  actual_arity = len(outcome.column_names)
-  is_arity_drift = (
-      (intent.strict_single_column and actual_arity != 1)
-      or abs(actual_arity - intent.expected_projection_arity) >= 2
-  )
-  if (
-      outcome.row_count > 0
-      and actual_arity > 0
-      and intent.expected_projection_arity > 0
-      and is_arity_drift
-  ):
-    issues.append(
-        InvariantIssue(
-            code="PROJECTION_ARITY_DRIFT",
-            severity="WARNING",
-            message=(
-                f"Projected {actual_arity} columns, whereas intent expects "
-                f"~{intent.expected_projection_arity}."
-            ),
-            repair_hint=(
-                "Project only the exact columns requested by the user question."
-            ),
-        )
-    )
+  # 6. Check projection arity alignment, 1-col follow-up under-projection, and
+  # narrow (`expected <= 2`) `SELECT *` / `table.*` over-projection escalation.
+  arity_issue = check_projection_arity_drift(sql_text, outcome, intent)
+  if arity_issue is not None:
+    issues.append(arity_issue)
 
   # 7. Detect unintended 1-to-many join fanout duplicates on entity listings.
   if (

@@ -166,6 +166,8 @@ class IntentFrame:
     expected_projection_arity: Estimated column count requested (`>= 1`).
     complexity: Estimated query complexity routing tier.
     strict_single_column: True when formula evidence mandates a 1-column scalar.
+    has_followup_projection: True when follow-up or `'their'` clauses require
+      projected columns beyond a single scalar/identifier (`>= 2`).
   """
 
   # Preserves both raw utterance and normalized intent for downstream stages.
@@ -178,6 +180,7 @@ class IntentFrame:
   expected_projection_arity: int
   complexity: QueryDifficulty
   strict_single_column: bool = False
+  has_followup_projection: bool = False
 
 
 # Output of hybrid value-grounded + Steiner FK-closure schema linking.

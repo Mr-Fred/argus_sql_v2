@@ -741,6 +741,299 @@ class ComparativePipelinesTest(unittest.TestCase):
           (("Hulk", 244, 1), ("Thor", 198, 2)),
       )
 
+  def test_iteration5_repair_dedup_select_star_stage4b_and_prompt_guardrails(
+      self,
+  ) -> None:
+    """Verifies QID 24 in-place repair dedup, QID 159 `*` Stage 4b, & QID 743."""
+    from collections.abc import Sequence
+    from argus_sql.adapters.types import LLMCompletionRequest
+    from argus_sql.adapters.types import LLMCompletionResponse
+    from argus_sql.pipelines.prompt_templates import SQLITE_SYSTEM_PROMPT
+    from argus_sql.pipelines.prompt_templates import build_strategy_request
+
+    # 1. QID 743 Prompt Guardrail Invariants: `SQLITE_SYSTEM_PROMPT` and all
+    #    synthesis strategies forbid `SELECT *` and preserve `LEFT JOIN` on
+    #    nullable foreign keys for parent entity counts/aggregations without
+    #    leaking `CAST(` or `IS NOT NULL` into non-defensive user prompts!
+    sys_low = SQLITE_SYSTEM_PROMPT.lower()
+    self.assertIn("select *", sys_low)
+    self.assertIn("left join", sys_low)
+    self.assertIn("nullable foreign keys", sys_low)
+    self.assertIn("parent", sys_low)
+
+    for strat in ("decomposed_cot", "formula_defensive", "skeleton_minimal"):
+      req = build_strategy_request(
+          request_id=f"r3-{strat}",
+          ddl_prompt="CREATE TABLE superhero (id INTEGER PRIMARY KEY);",
+          question="What is the percentage of bad superheroes?",
+          evidence="alignment = 'Bad'",
+          strategy_tag=strat,
+      )
+      u_low = req.user_prompt.lower()
+      self.assertIn("select *", u_low)
+      self.assertIn("left join", u_low)
+      self.assertIn("nullable foreign keys", u_low)
+      self.assertIn("parent", u_low)
+      if strat != "formula_defensive":
+        self.assertNotIn("CAST(", req.user_prompt)
+        self.assertNotIn("IS NOT NULL", req.user_prompt)
+
+    # 2. QID 24 & QID 159 End-to-End Pipeline Integration:
+    class _Iter5TrapMockLLM:
+      """Simulates QID 24 REAL-division `sname` trap & QID 159 `SELECT T1.*`."""
+
+      def batch_complete(
+          self, requests: Sequence[LLMCompletionRequest]
+      ) -> tuple[LLMCompletionResponse, ...]:
+        """Emits strategy-specific SQL traps and Stage 4b `SELECT *` repair.
+
+        Args:
+          requests: Batch of synthesis or Stage 4b repair requests.
+
+        Returns:
+          Tuple of mock SQL completion responses aligned 1-to-1 with requests.
+        """
+        outs: list[LLMCompletionResponse] = []
+        for req in requests:
+          if "withdrawals in cash" in req.user_prompt.lower():
+            if req.strategy_tag == "repair":
+              assert "PROJECTION_ARITY_DRIFT" in req.user_prompt
+              assert "SELECT *" in req.user_prompt
+              sql = (
+                  "SELECT T1.trans_id FROM trans AS T1 "
+                  "INNER JOIN disp AS T2 ON T1.account_id = T2.account_id "
+                  "WHERE T2.client_id = 3356 AND T1.operation = 'VYBER'"
+              )
+            else:
+              # All K=3 initial strategies over-project `SELECT T1.*`!
+              sql = (
+                  "SELECT T1.* FROM trans AS T1 "
+                  "INNER JOIN disp AS T2 ON T1.account_id = T2.account_id "
+                  "WHERE T2.client_id = 3356 AND T1.operation = 'VYBER'"
+              )
+          elif req.strategy_tag == "decomposed_cot":
+            # Clean untruncated `frpm."School Name"` candidate (1 vote).
+            sql = (
+                'SELECT T2."School Name" FROM satscores AS T1 '
+                "INNER JOIN frpm AS T2 ON T1.cds = T2.CDSCode "
+                'WHERE CAST(T2."Free Meal Count (K-12)" AS REAL) / '
+                'T2."Enrollment (K-12)" > 0.1 AND T1.NumGE1500 > 0'
+            )
+          elif req.strategy_tag == "formula_defensive":
+            # Empty result leaves 1 clean `School Name` vs 1 repaired `sname`.
+            sql = 'SELECT "School Name" FROM frpm WHERE 1 = 0'
+          else:
+            # `skeleton_minimal` divides REAL columns without CAST -> Stage 4a
+            # rewrites to CAST(...) producing IDENTICAL rows on `T1.sname`!
+            sql = (
+                "SELECT T1.sname FROM satscores AS T1 "
+                "INNER JOIN frpm AS T2 ON T1.cds = T2.CDSCode "
+                'WHERE T2."Free Meal Count (K-12)" / '
+                'T2."Enrollment (K-12)" > 0.1 AND T1.NumGE1500 > 0'
+            )
+          outs.append(LLMCompletionResponse(req.request_id, sql, sql, 80, 20))
+        return tuple(outs)
+
+    with tempfile.TemporaryDirectory() as tmp:
+      root = pathlib.Path(tmp)
+      db_file = root / "iter5_traps.sqlite"
+      conn = sqlite3.connect(db_file)
+      try:
+        conn.executescript("""
+          CREATE TABLE satscores (
+            cds TEXT PRIMARY KEY, sname TEXT, NumGE1500 INTEGER
+          );
+          CREATE TABLE frpm (
+            CDSCode TEXT PRIMARY KEY,
+            "School Name" TEXT,
+            "Free Meal Count (K-12)" REAL,
+            "Enrollment (K-12)" REAL
+          );
+          CREATE TABLE disp (
+            disp_id INTEGER PRIMARY KEY, client_id INTEGER, account_id INTEGER
+          );
+          CREATE TABLE trans (
+            trans_id INTEGER PRIMARY KEY,
+            account_id INTEGER,
+            operation TEXT,
+            amount INTEGER
+          );
+        """)
+        conn.execute(
+            "INSERT INTO satscores VALUES ('01', 'East LA Performing', 25)"
+        )
+        conn.execute(
+            "INSERT INTO frpm VALUES "
+            "('01', 'East LA Performing Arts Academy', 250.0, 500.0)"
+        )
+        conn.execute("INSERT INTO disp VALUES (1, 3356, 77)")
+        conn.execute("INSERT INTO trans VALUES (991, 77, 'VYBER', 500)")
+        conn.commit()
+      finally:
+        conn.close()
+
+      schema = DatabaseSchema(
+          db_id="iter5_traps",
+          tables=(
+              TableSchema(
+                  "satscores",
+                  (
+                      ColumnSchema("cds", "TEXT", is_primary_key=True),
+                      ColumnSchema("sname", "TEXT"),
+                      ColumnSchema("NumGE1500", "INTEGER"),
+                  ),
+              ),
+              TableSchema(
+                  "frpm",
+                  (
+                      ColumnSchema("CDSCode", "TEXT", is_primary_key=True),
+                      ColumnSchema("School Name", "TEXT"),
+                      ColumnSchema("Free Meal Count (K-12)", "REAL"),
+                      ColumnSchema("Enrollment (K-12)", "REAL"),
+                  ),
+              ),
+              TableSchema(
+                  "disp",
+                  (
+                      ColumnSchema("disp_id", "INTEGER", is_primary_key=True),
+                      ColumnSchema("client_id", "INTEGER"),
+                      ColumnSchema("account_id", "INTEGER"),
+                  ),
+              ),
+              TableSchema(
+                  "trans",
+                  (
+                      ColumnSchema("trans_id", "INTEGER", is_primary_key=True),
+                      ColumnSchema("account_id", "INTEGER"),
+                      ColumnSchema("operation", "TEXT"),
+                      ColumnSchema("amount", "INTEGER"),
+                  ),
+              ),
+          ),
+          foreign_keys=(
+              ForeignKeyEdge("satscores", "cds", "frpm", "CDSCode"),
+              ForeignKeyEdge("trans", "account_id", "disp", "account_id"),
+          ),
+      )
+      sandbox = SQLiteReadOnlySandbox(SandboxPolicy(allowed_db_root=root))
+      argus = ArgusSQLPipeline(_Iter5TrapMockLLM(), sandbox)
+
+      # QID 24: Identical-output algebraic repair upgrades `skeleton_minimal`
+      # in-place (`len == 3`, NOT `4`) and `School Name` defeats `sname`!
+      t_24 = NLQueryTask(
+          "24",
+          "iter5_traps",
+          "Give the names of the schools with the percent eligible for free "
+          "meals in K-12 is more than 0.1 and test takers whose test score "
+          "is greater than or equal to 1500?",
+          "Percent eligible = Free Meal Count (K-12) / Enrollment (K-12)",
+          QueryDifficulty.MODERATE,
+      )
+      p_24 = argus.predict(t_24, schema, db_file)
+      self.assertEqual(len(p_24.verified_candidates), 3)
+      self.assertEqual(
+          sandbox.execute(db_file, p_24.final_sql).rows,
+          (("East LA Performing Arts Academy",),),
+      )
+
+      # QID 159: `SELECT T1.*` at `expected_projection_arity == 1` escalates to
+      # `ERROR`, triggering Stage 4b diagnostic repair to `SELECT T1.trans_id`!
+      t_159 = NLQueryTask(
+          "159",
+          "iter5_traps",
+          "List all the withdrawals in cash transactions that the client "
+          "with the id 3356 makes.",
+          "operation = 'VYBER' refers to withdrawal in cash",
+          QueryDifficulty.SIMPLE,
+      )
+      p_159 = argus.predict(t_159, schema, db_file)
+      self.assertEqual(sandbox.execute(db_file, p_159.final_sql).rows, ((991,),))
+
+  def test_algebraic_repair_preserves_non_empty_parent_when_rewrite_returns_empty(
+      self,
+  ) -> None:
+    """Valid non-empty parent SQL must survive when `IS NOT NULL` yields 0 rows."""
+    # Import typed LLM request/response contracts for deterministic test mocking.
+    from collections.abc import Sequence
+    from argus_sql.adapters.types import LLMCompletionRequest
+    from argus_sql.adapters.types import LLMCompletionResponse
+
+    # Mock adapter returning an ascending ORDER BY query without IS NOT NULL.
+    class _NullableAscOrderMockLLM:
+      """Emits `ORDER BY pts ASC LIMIT 1` where matching rows have NULL `pts`."""
+
+      def batch_complete(
+          self, requests: Sequence[LLMCompletionRequest]
+      ) -> tuple[LLMCompletionResponse, ...]:
+        """Returns valid non-empty `ORDER BY pts ASC LIMIT 1` SQL.
+
+        Args:
+          requests: Batch of synthesis requests.
+
+        Returns:
+          Tuple of mock SQL completion responses aligned 1-to-1 with requests.
+        """
+        # Parent SQL succeeds with 1 row (`('Leclerc',)`), whereas injecting
+        # `AND pts IS NOT NULL` during Stage 4a wipes out all Monaco rows.
+        sql = (
+            "SELECT name FROM players WHERE country = 'Monaco' "
+            "ORDER BY pts ASC LIMIT 1"
+        )
+        return tuple(
+            LLMCompletionResponse(req.request_id, sql, sql, 45, 15)
+            for req in requests
+        )
+
+    # Create clean-room SQLite fixture where Monaco's only row has `pts IS NULL`.
+    with tempfile.TemporaryDirectory() as tmp:
+      root = pathlib.Path(tmp)
+      db_file = root / "players.sqlite"
+      conn = sqlite3.connect(db_file)
+      try:
+        # Populate one NULL-pts row for Monaco and one non-NULL control row.
+        conn.execute(
+            "CREATE TABLE players ("
+            "id INTEGER PRIMARY KEY, name TEXT, country TEXT, pts INTEGER)"
+        )
+        conn.executemany(
+            "INSERT INTO players VALUES (?, ?, ?, ?)",
+            [(1, "Leclerc", "Monaco", None), (2, "Gasly", "France", 10)],
+        )
+        conn.commit()
+      finally:
+        conn.close()
+
+      # Declare typed DatabaseSchema matching the SQLite `players` table.
+      schema = DatabaseSchema(
+          db_id="players",
+          tables=(
+              TableSchema(
+                  "players",
+                  (
+                      ColumnSchema("id", "INTEGER", is_primary_key=True),
+                      ColumnSchema("name", "TEXT"),
+                      ColumnSchema("country", "TEXT"),
+                      ColumnSchema("pts", "INTEGER"),
+                  ),
+              ),
+          ),
+      )
+      # Run Argus-SQL end-to-end inside SQLiteReadOnlySandbox.
+      sandbox = SQLiteReadOnlySandbox(SandboxPolicy(allowed_db_root=root))
+      argus = ArgusSQLPipeline(_NullableAscOrderMockLLM(), sandbox)
+      task = NLQueryTask(
+          question_id="alg_keep_parent",
+          db_id="players",
+          question="Who is the player from Monaco with the lowest pts?",
+          difficulty=QueryDifficulty.MODERATE,
+      )
+      pred = argus.predict(task, schema, db_file)
+      # Stage 4a's `AND pts IS NOT NULL` rewrite yields 0 rows and must NOT
+      # clobber the valid `(('Leclerc',),)` parent candidate!
+      final_out = sandbox.execute(db_file, pred.final_sql)
+      self.assertEqual(final_out.rows, (("Leclerc",),))
+      self.assertNotIn("IS NOT NULL", pred.final_sql)
+
 
 if __name__ == "__main__":
   unittest.main()

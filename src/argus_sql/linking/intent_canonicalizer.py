@@ -11,6 +11,8 @@ from argus_sql.contracts.types import IntentFrame
 from argus_sql.contracts.types import QueryDifficulty
 from argus_sql.linking.asr_normalizer import ENTITY_STOPWORDS
 from argus_sql.linking.asr_normalizer import clean_asr_utterance
+from argus_sql.linking.projection_arity import IMPERATIVE_RANK_RE
+from argus_sql.linking.projection_arity import estimate_projection_spec
 
 # Common spoken geographic/domain abbreviations mapped to canonical forms.
 _SPOKEN_EXPANSIONS: tuple[tuple[str, str], ...] = (
@@ -41,12 +43,6 @@ _EXTREMA_CUE_RE = re.compile(
 _CHALLENGING_CUE_RE = re.compile(
     r"\b(?:among\s+those|more\s+than\s+the\s+average|less\s+than\s+the\s+average"
     r"|difference\s+between|compared\s+to|both\s+.*\s+and|neither)\b",
-    re.IGNORECASE,
-)
-
-# Matches imperative `Rank <entities> by <metric>` analytical ranking prompts.
-_IMPERATIVE_RANK_RE = re.compile(
-    r"^(?:please\s+)?rank\s+(?!of\b)\S+[\s\S]*\bby\b",
     re.IGNORECASE,
 )
 
@@ -155,100 +151,9 @@ def _extract_entity_candidates(question: str, evidence: str) -> tuple[str, ...]:
 
 def _estimate_projection_arity(canonical_q: str) -> int:
   """Estimates requested output arity (`0` = unconstrained narrative prompt)."""
-  lower = canonical_q.lower()
-  # Explicit single-output directives override narrative context.
-  if re.search(
-      r"\b(?:only|just)\s+need\s+the\s+(?:single\s+)?(?:count|total|number|"
-      r"average|percentage|rate|ratio|difference|score|value|name|id)\b",
-      lower,
-  ):
-    return 1
-
-  # Multi-sentence narrative briefings (>38 words or >=2 periods) frequently
-  # specify custom 4..16 column schemas; leave unconstrained (`0`).
-  body_no_end = canonical_q.rstrip(".?!")
-  if len(canonical_q.split()) > 38 or body_no_end.count(".") >= 2:
-    return 0
-
-  # Expand compound multi-field shorthand; leave plural 'full names' unconstrained
-  # because schemas represent full names across 1, 2, 3, or 6 columns.
-  if "full communication address" in lower or "complete address" in lower:
-    return 4
-  if "full names" in lower:
-    return 0
-
-  # Imperative `Rank <entities> by <metric>` projects `(entity, metric, rank)`.
-  if _IMPERATIVE_RANK_RE.match(canonical_q):
-    return 3
-
-  # Detect multi-pair comparison tails ('between A and B, B and C, and C and A').
-  pair_tail = re.search(
-      r"\bbetween\s+([^?.!]+,\s*[^?.!]+\band\b[^?.!]+)",
-      lower,
-  )
-  if pair_tail:
-    pair_clauses = [
-        seg.strip()
-        for seg in pair_tail.group(1).split(",")
-        if " and " in seg.lower()
-    ]
-    if len(pair_clauses) >= 2:
-      return min(len(pair_clauses), 5)
-
-  # Detect dual superlative pairs ('biggest and lowest', 'highest and lowest').
-  if re.search(
-      r"\b(?:biggest|highest|largest|most|maximum)\s+and\s+"
-      r"(?:lowest|smallest|least|minimum)\b",
-      lower,
-  ):
-    return 2
-
-  # Inspect follow-up projection sentences after `.`, `;`, or `?` (`? Show ...`,
-  # `? Indicate ...`) while ignoring decimal-rounding instructions.
-  followup = re.search(
-      r"(?:[.;?]\s*(?:please\s+)?(?:indicate|include|provide|show|identify|"
-      r"state|list|give)\s+|\b(?:along\s+with|as\s+well\s+as)\s+)([^?.!;]{3,90})",
-      lower,
-  )
-  if followup:
-    tail_clause = followup.group(1).strip()
-    if not re.match(r"^(?:your\s+answer|the\s+answer|it\s+as)\b", tail_clause):
-      extra_parts = [
-          p.strip()
-          for p in re.split(r",|\band\b|\bas\s+well\s+as\b", tail_clause)
-          if p.strip() and len(p.split()) <= 6
-      ]
-      return max(2, min(1 + len(extra_parts), 5)) if extra_parts else 2
-
-  # Explicit single-sentence scalar aggregations ('how many', 'what is the avg').
-  if re.match(
-      r"^(?:how\s+many|what\s+(?:is|was)\s+the\s+(?:total|average|mean|ratio|"
-      r"rate|percentage|number|count|highest|lowest|maximum|minimum|difference))\b",
-      lower,
-  ):
-    if (
-        " and " not in lower[:55]
-        and "." not in body_no_end
-        and "?" not in body_no_end
-    ):
-      return 1
-
-  # Look for compact 'list/give/show/what are the X and Y of/for' projections.
-  proj_match = re.search(
-      r"\b(?:list|give|show|what\s+are)\s+(?:the\s+|each\s+)?"
-      r"([^,?.!;]{1,40}(?:,\s*[^,?.!;]{1,30})*(?:\s+and\s+[^,?.!;]{1,30})?)\s+"
-      r"(?:of|for|in|among|where|with|by)\b",
-      lower,
-  )
-  if proj_match:
-    parts = [
-        p.strip()
-        for p in re.split(r",|\band\b", proj_match.group(1))
-        if p.strip() and len(p.split()) <= 6
-    ]
-    if parts:
-      return max(1, min(len(parts), 5))
-  return 1
+  # Retain single-int helper compatibility around `estimate_projection_spec`.
+  arity, _ = estimate_projection_spec(canonical_q)
+  return arity
 
 
 def canonicalize_intent(question: str, evidence: str = "") -> IntentFrame:
@@ -264,14 +169,16 @@ def canonicalize_intent(question: str, evidence: str = "") -> IntentFrame:
   # Delegate spoken filler removal and ASR casing alignment to `asr_normalizer`.
   cleaned, removed_count = clean_asr_utterance(question, evidence)
 
+  # Inspect both question and external evidence for REAL division and extrema.
   combined = f"{cleaned} {evidence}"
   needs_float_div = bool(
       _DIVISION_CUE_RE.search(combined) or "/" in evidence
   )
   needs_extrema = bool(_EXTREMA_CUE_RE.search(cleaned))
-  is_rank_query = bool(_IMPERATIVE_RANK_RE.match(cleaned))
+  is_rank_query = bool(IMPERATIVE_RANK_RE.match(cleaned))
   entities = _extract_entity_candidates(cleaned, evidence)
-  arity = _estimate_projection_arity(cleaned)
+  # Extract expected SELECT arity and multi-column follow-up indicator together.
+  arity, has_followup = estimate_projection_spec(cleaned)
   # Explicit `calculation =` evidence without follow-up columns mandates arity 1.
   strict_single = bool(
       arity == 1 and re.search(r"\bcalculation\s*=", evidence, re.IGNORECASE)
@@ -293,6 +200,7 @@ def canonicalize_intent(question: str, evidence: str = "") -> IntentFrame:
   else:
     complexity = QueryDifficulty.SIMPLE
 
+  # Return immutable IntentFrame contract consumed by linking and verification.
   return IntentFrame(
       raw_question=question,
       canonical_question=cleaned,
@@ -303,4 +211,5 @@ def canonicalize_intent(question: str, evidence: str = "") -> IntentFrame:
       expected_projection_arity=arity,
       complexity=complexity,
       strict_single_column=strict_single,
+      has_followup_projection=has_followup,
   )

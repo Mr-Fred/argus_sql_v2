@@ -393,6 +393,132 @@ class LinkingModuleTest(unittest.TestCase):
     self.assertNotIn("Los Angeles", spoken_spans)
     self.assertNotIn("New York", spoken_spans)
 
+  def test_iteration5_their_clauses_and_multi_attribute_followup_arity(
+      self,
+  ) -> None:
+    """Widens `'their'` & follow-up arity (QID 1157, 866_voice) safely."""
+    # 1. QID 1157 Clean & Voice `'their ID, sex and disease ...'` estimates 3.
+    ev_1157 = (
+        "severe degree of thrombosis refers to thrombosis = 2; "
+        "disease refers to diagnosis;"
+    )
+    clean_1157 = canonicalize_intent(
+        "For patients with severe degree of thrombosis, list their ID, sex "
+        "and disease the patient is diagnosed with.",
+        ev_1157,
+    )
+    voice_1157 = canonicalize_intent(
+        "uh hey can you please tell me for patients with you know severe "
+        "degree of thrombosis, list their id, sex and disease the patient is "
+        "diagnosed with",
+        ev_1157,
+    )
+    self.assertEqual(clean_1157.expected_projection_arity, 3)
+    self.assertTrue(clean_1157.has_followup_projection)
+    self.assertEqual(voice_1157.expected_projection_arity, 3)
+    self.assertTrue(voice_1157.has_followup_projection)
+
+    # 2. Spoken `866_voice` follow-up `? show his introduction website` sets 2
+    #    with `has_followup_projection=True` so 1-col SQL outputs are flagged.
+    voice_866 = canonicalize_intent(
+        "uh hey can you please tell me who was the you know player that got "
+        "the lap time of 0:01:27 in the race no. 161? show his introduction "
+        "website",
+        "player and driver are synonyms; introduction website refers to url;",
+    )
+    self.assertEqual(voice_866.expected_projection_arity, 2)
+    self.assertTrue(voice_866.has_followup_projection)
+
+    # 3. Multi-attribute follow-ups (`? Also list ...`, multi-head + follow-up,
+    #    and conjoined entity + `'their'` lists) widen arity accurately.
+    also_followup = canonicalize_intent(
+        "Which drivers competed in 2009? Also list their forename and nationality."
+    )
+    self.assertEqual(also_followup.expected_projection_arity, 3)
+    self.assertTrue(also_followup.has_followup_projection)
+
+    multi_head_followup = canonicalize_intent(
+        "What is the phone number and extension number for the school with "
+        "zip code 95203? Indicate the school's name."
+    )
+    self.assertEqual(multi_head_followup.expected_projection_arity, 3)
+    self.assertTrue(multi_head_followup.has_followup_projection)
+
+    entity_their = canonicalize_intent(
+        "List the clients and their account ID and birth date."
+    )
+    self.assertEqual(entity_their.expected_projection_arity, 3)
+    self.assertTrue(entity_their.has_followup_projection)
+
+    # 4. Boundary guards: `'their'` inside a WHERE filter or explicit single-value
+    #    directive (`Give me the single ...`) must remain arity 1 (`False`).
+    where_their = canonicalize_intent(
+        "List the schools where students bring their lunch and snacks."
+    )
+    self.assertEqual(where_their.expected_projection_arity, 1)
+    self.assertFalse(where_their.has_followup_projection)
+
+    single_val = canonicalize_intent(
+        "What was their average monthly consumption? "
+        "Give me the single average value rounded to two decimal places."
+    )
+    self.assertEqual(single_val.expected_projection_arity, 1)
+    self.assertFalse(single_val.has_followup_projection)
+
+  def test_followup_arity_declarative_context_filter_tails_and_asr_unpunctuated(
+      self,
+  ) -> None:
+    """Guards 1-col context/filter queries while catching ASR `and also show`."""
+    # 1. Two-sentence `[Declarative context]. [1-col question]` must NOT be
+    #    misclassified as an additive 2-column follow-up projection.
+    for one_col_context_q in (
+        "Charter schools refer to Charter = 1 in frpm. "
+        "What is the total number of charter schools?",
+        "A severe thrombosis has a degree of 2. "
+        "List the ID of patients with severe thrombosis.",
+        "Account 45 belongs to the Prague branch. "
+        "State the balance of this account.",
+    ):
+      ctx_intent = canonicalize_intent(one_col_context_q)
+      self.assertEqual(ctx_intent.expected_projection_arity, 1)
+      self.assertFalse(ctx_intent.has_followup_projection)
+
+    # 2. Single-column `'their'`/`'his'` queries with trailing prepositional
+    #    filters containing `'and'` (or subordinate clauses) stay `(1, False)`.
+    for one_col_filter_q in (
+        "What was their consumption between 2012 and 2013?",
+        "For active members, list their ID for accounts with loans and deposits.",
+        "Show his lap time in 2008 and 2009.",
+        "List their email from offices in New York and California.",
+        "List their email in New York and California.",
+        "How many users show their email and phone?",
+        "What is the total consumption of fuels, including diesel and gasoline?",
+    ):
+      flt_intent = canonicalize_intent(one_col_filter_q)
+      self.assertEqual(flt_intent.expected_projection_arity, 1)
+      self.assertFalse(flt_intent.has_followup_projection)
+
+    # 3. 3-column `'their'` query with `>8`-word `for ...` filter and `'Find
+    #    their ...'` retain all 3 attributes (`(3, True)`).
+    long_for = canonicalize_intent(
+        "List their ID, sex and diagnosis for all patients with severe degree "
+        "of thrombosis."
+    )
+    self.assertEqual(long_for.expected_projection_arity, 3)
+    self.assertTrue(long_for.has_followup_projection)
+
+    find_their = canonicalize_intent("Find their ID, sex and diagnosis.")
+    self.assertEqual(find_their.expected_projection_arity, 3)
+    self.assertTrue(find_their.has_followup_projection)
+
+    # 4. Unpunctuated spoken ASR follow-up (`and also show ...`) widens to 2.
+    asr_unpunct = canonicalize_intent(
+        "uh hey can you please tell me who was the player that got the lap "
+        "time of 0:01:27 in race 161 and also show his introduction website"
+    )
+    self.assertEqual(asr_unpunct.expected_projection_arity, 2)
+    self.assertTrue(asr_unpunct.has_followup_projection)
+
 
 if __name__ == "__main__":
   unittest.main()
