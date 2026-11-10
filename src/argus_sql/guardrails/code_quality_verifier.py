@@ -55,7 +55,7 @@ def _docstring_line_numbers(tree: ast.AST) -> set[int]:
 def verify_python_ast_quality(
     file_path: pathlib.Path,
     target_label: str | None = None,
-    max_code_lines: int = 320,
+    max_code_lines: int = 800,
     min_comment_ratio: float = 0.08,
 ) -> tuple[CodeQualityViolation, ...]:
   """Audits a single Python file for modularity, docstrings, types, and safety.

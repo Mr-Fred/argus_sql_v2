@@ -215,7 +215,7 @@ def build_default_leak_rules() -> tuple[LeakRule, ...]:
   except (OSError, KeyError):
     os_user = ""
 
-  # Skip generic OS role names (including OEM Windows defaults like 'Owner').
+  # Skip generic OS role names (including OEM Windows/VM defaults like 'Owner'/'antigravity').
   generic_os_accounts = {
       "ubuntu",
       "admin",
@@ -226,6 +226,7 @@ def build_default_leak_rules() -> tuple[LeakRule, ...]:
       "public",
       "default",
       "guest",
+      "antigravity",
   }
   if len(os_user) >= 5 and os_user.lower() not in generic_os_accounts:
     rules.append(

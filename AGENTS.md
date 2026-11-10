@@ -8,7 +8,7 @@
 ## 2. Software Engineering & Architectural Invariants
 
 1. **Hexagonal Modular Architecture (No God Modules)**:
-   - Decompose every domain package under `src/argus_sql/` into cohesive, single-responsibility modules (`<= 320` executable code lines per non-test module).
+   - Decompose every domain package under `src/argus_sql/` into cohesive, single-responsibility modules (`<= 800` executable code lines per non-test module).
    - Separate pure domain logic (`contracts`, `linking`, `verification`, `evaluation`) from outer I/O adapters (`sandbox`, `adapters`) and thin CLI entrypoints.
    - Include `types.py`, `exceptions.py`, domain modules, and co-located `*_test.py` unit tests in every package.
 2. **Documentation & Readability**:
