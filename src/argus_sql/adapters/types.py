@@ -1,4 +1,4 @@
-"""Typed request, response, and port contracts for batch LLM SQL generation."""
+"""Typed request, response, cache, and port contracts for batch LLM adapters."""
 
 from collections.abc import Sequence
 import dataclasses
@@ -6,6 +6,8 @@ from typing import Protocol
 
 
 # Immutable single prompt payload submitted inside a batched completion call.
+# Optional `thinking_budget` and `cached_content` fields preserve full R1/R3
+# backward compatibility across all existing 6-argument pipeline call sites.
 @dataclasses.dataclass(frozen=True)
 class LLMCompletionRequest:
   """Single prompt completion specification within a batched LLM call.
@@ -16,7 +18,9 @@ class LLMCompletionRequest:
     user_prompt: Schema DDL, question, evidence, and optional repair feedback.
     strategy_tag: Synthesis strategy name ('zero_shot', 'decomposed_cot', etc.).
     temperature: Sampling temperature (`0.0` for greedy deterministic decoding).
-    max_tokens: Maximum completion tokens allowed.
+    max_tokens: Legacy maximum token hint (unclamped on Vertex Gemini R3).
+    thinking_budget: Optional per-request Gemini `thinkingBudget` override.
+    cached_content: Optional Vertex AI `cachedContents/...` resource path.
   """
 
   # Greedy decoding (`temperature=0.0`) maximizes SQL determinism by default.
@@ -26,6 +30,8 @@ class LLMCompletionRequest:
   strategy_tag: str = "zero_shot"
   temperature: float = 0.0
   max_tokens: int = 512
+  thinking_budget: int | None = None
+  cached_content: str | None = None
 
 
 # Normalized completion response returned by any BatchLLMPort implementation.
@@ -73,7 +79,33 @@ class LLMCompletionResponse:
   @property
   def logical_tokens(self) -> int:
     """Returns total standalone prompt + completion tokens for a candidate."""
+    # Combine effective input and output tokens for standalone baseline metrics.
     return self.effective_prompt_tokens + self.effective_completion_tokens
+
+
+# Server-side Vertex AI CachedContent metadata handle scoped to one `db_id`.
+@dataclasses.dataclass(frozen=True)
+class VertexCachedContent:
+  """Immutable handle describing an active Vertex AI `CachedContent` resource.
+
+  Attributes:
+    cache_name: Canonical `projects/.../locations/.../cachedContents/...` path.
+    db_id: Benchmark database identifier cached in this resource.
+    model_name: Normalized Gemini model slug bound to the cached prefix.
+    ttl_seconds: Configured cache time-to-live in seconds (e.g., `1800`..`3600`).
+    expire_time: RFC 3339 expiration timestamp returned by Vertex AI.
+    total_token_count: Cached prefix token count reported in `usageMetadata`.
+    system_prompt_sha256: SHA-256 hex digest of cached `systemInstruction` text.
+  """
+
+  # Store SHA-256 of `systemInstruction` to guard against prompt mismatches.
+  cache_name: str
+  db_id: str
+  model_name: str
+  ttl_seconds: int
+  expire_time: str = ""
+  total_token_count: int = 0
+  system_prompt_sha256: str = ""
 
 
 # Hexagonal port decoupling pipelines from specific cloud/local LLM SDKs.

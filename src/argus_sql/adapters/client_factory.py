@@ -1,11 +1,12 @@
 """Provider-routing factory and safe `.env` reader for live batch LLM clients.
 
 Resolves non-secret runtime environment defaults (such as `GOOGLE_CLOUD_PROJECT`,
-`GOOGLE_CLOUD_LOCATION`, and `GOOGLE_GENAI_USE_ENTERPRISE`) and constructs the
-appropriate `BatchLLMPort` adapter (`VertexGeminiBatchClient` or
-`OpenAICompatibleBatchClient`).
+`GOOGLE_CLOUD_LOCATION`, `GOOGLE_GENAI_USE_ENTERPRISE`, and
+`ARGUS_THINKING_BUDGET`) and constructs the appropriate `BatchLLMPort` adapter
+(`VertexGeminiBatchClient` or `OpenAICompatibleBatchClient`).
 """
 
+from collections.abc import Mapping
 import logging
 import os
 import pathlib
@@ -14,6 +15,7 @@ from argus_sql.adapters.exceptions import LLMAdapterAuthError
 from argus_sql.adapters.llm_batch_client import OpenAICompatibleBatchClient
 from argus_sql.adapters.types import BatchLLMPort
 from argus_sql.adapters.vertex_gemini_client import VertexGeminiBatchClient
+from argus_sql.adapters.vertex_gemini_client import parse_thinking_budget
 
 # Module-level logger following Google Python Style Guide lazy-% conventions.
 _LOGGER = logging.getLogger(__name__)
@@ -83,37 +85,23 @@ _PLACEHOLDER_PROJECTS: frozenset[str] = frozenset({
 _DEFAULT_OPENAI_ENDPOINT = "https://api.openai.com/v1/chat/completions"
 
 
-def build_live_llm_client(
-    provider: str = "auto",
-    model_name: str = "auto",
-    endpoint_url: str = _DEFAULT_OPENAI_ENDPOINT,
-    gcp_project: str | None = None,
-    gcp_location: str | None = None,
-    dotenv_path: pathlib.Path | None = None,
-) -> BatchLLMPort:
-  """Constructs a `BatchLLMPort` client for OpenAI-compatible or Vertex Gemini.
-
-  Args:
-    provider: `'auto'`, `'vertex'`, or `'openai'`.
-    model_name: Model slug (`'auto'` selects provider-appropriate default).
-    endpoint_url: Chat completions URL when `provider` resolves to `'openai'`.
-    gcp_project: Optional GCP project override for Vertex AI / Gemini Enterprise.
-    gcp_location: Optional Vertex AI location override (defaults to `'global'`).
-    dotenv_path: Optional `.env` file path for non-secret local defaults.
-
-  Returns:
-    Configured `BatchLLMPort` instance ready for concurrent batch execution.
-
-  Raises:
-    LLMAdapterAuthError: If `provider` is unknown or required settings are absent.
-  """
-  cfg = load_dotenv_defaults(dotenv_path)
+def _resolve_provider_and_credentials(
+    provider: str,
+    gcp_project: str | None,
+    cfg: Mapping[str, str],
+) -> tuple[str, str, str]:
+  """Resolves canonical provider (`'vertex'` or `'openai'`), project, and key."""
+  # Normalize provider flag and reject unknown backend strings early.
   norm_provider = provider.strip().lower()
   if norm_provider not in {"auto", "openai", "vertex"}:
     raise LLMAdapterAuthError(f"Unsupported LLM provider '{provider}'.")
 
   # Ignore unedited `.env` template placeholders when resolving GCP project ID.
-  raw_project = (gcp_project or cfg.get("GOOGLE_CLOUD_PROJECT", "")).strip()
+  explicit_proj = (gcp_project or "").strip()
+  valid_explicit_proj = (
+      "" if explicit_proj.lower() in _PLACEHOLDER_PROJECTS else explicit_proj
+  )
+  raw_project = (valid_explicit_proj or cfg.get("GOOGLE_CLOUD_PROJECT", "")).strip()
   resolved_project = (
       "" if raw_project.lower() in _PLACEHOLDER_PROJECTS else raw_project
   )
@@ -126,19 +114,74 @@ def build_live_llm_client(
       or cfg.get("OPENAI_API_KEY", "").strip()
   )
   if norm_provider == "auto":
-    # Prefer OpenAI when an API key is supplied without a real GCP project ID.
+    # Prefer OpenAI when an API key is supplied without Vertex Enterprise/project.
     use_vertex = bool(
-        gcp_project
+        valid_explicit_proj
         or (enterprise_on and resolved_project)
         or (resolved_project and not resolved_api_key)
         or (enterprise_on and not resolved_api_key)
     )
     norm_provider = "vertex" if use_vertex else "openai"
+  return (norm_provider, resolved_project, resolved_api_key)
+
+
+def _resolve_validated_thinking_budget(
+    thinking_budget: int | None,
+    cfg: Mapping[str, str],
+) -> int:
+  """Validates explicit `thinking_budget` or `ARGUS_THINKING_BUDGET` eagerly."""
+  # Prefer explicit caller argument; otherwise inspect `.env` / `os.environ`.
+  # Validating before provider routing ensures `-5`, `True`, and `'abc'` fail
+  # closed even when `provider='openai'` or `fallback_to_none=True`.
+  raw_budget: int | str | None = (
+      thinking_budget
+      if thinking_budget is not None
+      else cfg.get("ARGUS_THINKING_BUDGET", "").strip() or None
+  )
+  return parse_thinking_budget(raw_budget)
+
+
+def build_live_llm_client(
+    provider: str = "auto",
+    model_name: str = "auto",
+    endpoint_url: str = _DEFAULT_OPENAI_ENDPOINT,
+    gcp_project: str | None = None,
+    gcp_location: str | None = None,
+    dotenv_path: pathlib.Path | None = None,
+    thinking_budget: int | None = None,
+) -> BatchLLMPort:
+  """Constructs a `BatchLLMPort` client for OpenAI-compatible or Vertex Gemini.
+
+  Args:
+    provider: `'auto'`, `'vertex'`, or `'openai'`.
+    model_name: Model slug (`'auto'` selects `'gemini-3.7-flash'` on Vertex AI).
+    endpoint_url: Chat completions URL when `provider` resolves to `'openai'`.
+    gcp_project: Optional GCP project override for Vertex AI / Gemini Enterprise.
+    gcp_location: Optional Vertex AI location override (defaults to `'global'`).
+    dotenv_path: Optional `.env` file path for non-secret local defaults.
+    thinking_budget: Optional Gemini `thinkingBudget` override; falls back to
+      `ARGUS_THINKING_BUDGET` in environment / `.env` (`2048` default).
+
+  Returns:
+    Configured `BatchLLMPort` instance ready for concurrent batch execution.
+
+  Raises:
+    LLMAdapterAuthError: If `provider` or `thinking_budget` is invalid, or if
+      required credentials/settings are absent.
+  """
+  cfg = load_dotenv_defaults(dotenv_path)
+  # Validate `thinking_budget` / `ARGUS_THINKING_BUDGET` eagerly before
+  # provider resolution so invalid budgets fail closed on every backend.
+  resolved_budget = _resolve_validated_thinking_budget(thinking_budget, cfg)
+  norm_provider, resolved_project, resolved_api_key = (
+      _resolve_provider_and_credentials(provider, gcp_project, cfg)
+  )
 
   # Resolve model slug from explicit CLI flag, `ARGUS_LLM_MODEL`, or provider default.
   raw_model = model_name.strip()
   if not raw_model or raw_model.lower() == "auto":
     env_model = cfg.get("ARGUS_LLM_MODEL", "").strip()
+    # Reserve `gemini-3.7-flash` as the Vertex default for core SQL synthesis.
     default_slug = "gemini-3.7-flash" if norm_provider == "vertex" else "gpt-4o-mini"
     resolved_model = env_model or default_slug
   else:
@@ -156,14 +199,16 @@ def build_live_llm_client(
     ).strip()
     # Log non-secret routing metadata via lazy-% formatting.
     _LOGGER.info(
-        "Initialized VertexGeminiBatchClient (location=%s, model=%s).",
+        "Initialized VertexGeminiBatchClient (location=%s, model=%s, budget=%d).",
         resolved_loc,
         resolved_model,
+        resolved_budget,
     )
     return VertexGeminiBatchClient(
         project_id=resolved_project,
         model_name=resolved_model,
         location=resolved_loc,
+        thinking_budget=resolved_budget,
     )
 
   # Allow `.env` `ARGUS_LLM_ENDPOINT_URL` to target local loopback vLLM servers.
@@ -188,52 +233,63 @@ def build_intent_llm_client(
     gcp_location: str | None = None,
     dotenv_path: pathlib.Path | None = None,
     fallback_to_none: bool = True,
+    thinking_budget: int | None = None,
 ) -> BatchLLMPort | None:
-  """Constructs a fast `flash-lite` `BatchLLMPort` for Stage 1 intent extraction.
+  """Constructs a `gemini-2.5-flash` `BatchLLMPort` for Stage 1 intent routing.
 
   In hermetic or unconfigured offline environments, returns `None` when
   `fallback_to_none=True` so Stage 1 automatically uses the deterministic FSM.
 
   Args:
     provider: `'auto'`, `'vertex'`, or `'openai'`.
-    model_name: Intent model slug (`'auto'` picks `gemini-2.5-flash-lite` or
-      `gpt-4o-mini`, overridden by `ARGUS_INTENT_LLM_MODEL`).
+    model_name: Intent model slug (`'auto'` selects `'gemini-2.5-flash'` on
+      Vertex AI or `'gpt-4o-mini'` on OpenAI, overridden by
+      `ARGUS_INTENT_LLM_MODEL`).
     endpoint_url: Chat completions URL when `provider` resolves to `'openai'`.
     gcp_project: Optional GCP project override for Vertex AI.
     gcp_location: Optional Vertex AI location override.
     dotenv_path: Optional `.env` file path for non-secret local defaults.
     fallback_to_none: Return `None` on missing credentials instead of raising.
+    thinking_budget: Optional `thinkingBudget` override passed to Vertex client.
 
   Returns:
     Configured `BatchLLMPort` or `None` when offline fallback applies.
 
   Raises:
-    LLMAdapterAuthError: If `fallback_to_none=False` and credentials are absent.
+    LLMAdapterAuthError: If `provider` or `thinking_budget` is invalid, or if
+      `fallback_to_none=False` and credentials are absent.
   """
   cfg = load_dotenv_defaults(dotenv_path)
+  # Validate `thinking_budget` / `ARGUS_THINKING_BUDGET` eagerly before
+  # provider routing or `fallback_to_none` catching so bad budgets never
+  # silently return `None` in offline environments.
+  resolved_budget = _resolve_validated_thinking_budget(thinking_budget, cfg)
+  # Share exact provider auto-detection logic with `build_live_llm_client`.
+  norm_provider, _, _ = _resolve_provider_and_credentials(
+      provider, gcp_project, cfg
+  )
+
   raw_model = model_name.strip()
   if not raw_model or raw_model.lower() == "auto":
     env_intent_model = cfg.get("ARGUS_INTENT_LLM_MODEL", "").strip()
-    # Select lightweight flash-lite / mini tier matching the resolved provider.
-    raw_proj = (gcp_project or cfg.get("GOOGLE_CLOUD_PROJECT", "")).strip()
-    is_vertex = provider.strip().lower() == "vertex" or (
-        provider.strip().lower() == "auto"
-        and bool(raw_proj and raw_proj.lower() not in _PLACEHOLDER_PROJECTS)
-    )
+    # Route Vertex AI Stage 1 intent extraction to `gemini-2.5-flash` per R4.
+    is_vertex = norm_provider == "vertex"
     resolved_model = env_intent_model or (
-        "gemini-2.5-flash-lite" if is_vertex else "gpt-4o-mini"
+        "gemini-2.5-flash" if is_vertex else "gpt-4o-mini"
     )
   else:
     resolved_model = raw_model
 
+  # Delegate construction while gracefully returning `None` offline if enabled.
   try:
     return build_live_llm_client(
-        provider=provider,
+        provider=norm_provider,
         model_name=resolved_model,
         endpoint_url=endpoint_url,
         gcp_project=gcp_project,
         gcp_location=gcp_location,
         dotenv_path=dotenv_path,
+        thinking_budget=resolved_budget,
     )
   except LLMAdapterAuthError as err:
     if not fallback_to_none:

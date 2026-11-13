@@ -51,8 +51,9 @@ _SCANNABLE_SUFFIXES: frozenset[str] = frozenset({
 # Directory names skipped during file traversal (build/VCS/IDE caches and
 # gitignored quarantine staging folders).
 # Skipping `.git` avoids scanning binary packfiles; Git config is checked separately.
-# Skipping local IDE state (`.antigravity`, `.gemini`, `.vscode`, `.idea`) avoids
-# false positives when Windows IDEs record local `python.exe` interpreter paths.
+# Skipping local IDE/agent state (`.agents`, `.antigravity`, `.gemini`,
+# `.vscode`, `.idea`) avoids false positives when IDEs or local agent harnesses
+# record workspace metadata or immutable user prompt transcripts.
 # Skipping `audit_import` keeps un-audited external archives quarantined until
 # explicitly audited via `--scan-path`.
 _IGNORED_DIRS: frozenset[str] = frozenset({
@@ -66,6 +67,7 @@ _IGNORED_DIRS: frozenset[str] = frozenset({
     "build",
     "dist",
     "node_modules",
+    ".agents",
     ".antigravity",
     ".gemini",
     ".vscode",

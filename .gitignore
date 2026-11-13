@@ -39,7 +39,8 @@ paper/*.out
 paper/*.synctex.gz
 paper/*.toc
 
-# Local IDE workspace metadata (Antigravity IDE, VS Code, JetBrains) & OS cruft
+# Local IDE & agent workspace metadata (Antigravity IDE, VS Code, JetBrains) & OS cruft
+.agents/
 .antigravity/
 .gemini/
 .vscode/
